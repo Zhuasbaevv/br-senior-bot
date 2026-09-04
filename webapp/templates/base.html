@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}BR Management{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">BR Management</div>
+      {% for group_title, items in nav %}
+      <div class="nav-group">
+        <div class="nav-group-title">{{ group_title }}</div>
+        {% for item in items %}
+        <a class="nav-item {% if request.url.path == item.href %}active{% endif %}" href="{{ item.href }}">
+          <span>{{ item.label }}</span>
+          {% if not item.ready %}<span class="badge">soon</span>{% endif %}
+        </a>
+        {% endfor %}
+      </div>
+      {% endfor %}
+      <div class="user-box">
+        <div class="nick">{{ user.nickname }}</div>
+        <div class="role">{{ role_name(user.role) }}{% if user.org %} · {{ user.org }}{% endif %}</div>
+        <a class="logout" href="/logout">Выйти</a>
+      </div>
+    </aside>
+    <main class="main">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

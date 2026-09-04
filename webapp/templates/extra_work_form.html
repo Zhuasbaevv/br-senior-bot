@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Доп баллы</h1>
+
+{% if result %}
+<div class="alert ok">
+  ✅ Ваша отчетность была успешно отправлена руководству!<br>
+  Работа: {{ result.description }}
+</div>
+{% endif %}
+
+<div class="panel">
+  <form method="post" enctype="multipart/form-data">
+    <label>Скриншот проделанной работы</label>
+    <input type="file" name="photo" accept="image/*" required>
+    <label>Опишите одним словом вашу проделанную работу за сегодня</label>
+    <input type="text" name="description" required>
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Отправить</button>
+    </div>
+  </form>
+</div>
+{% endblock %}
