@@ -14,7 +14,7 @@ pip install -r requirements.txt --break-system-packages
 Заполните переменные окружения (или отредактируйте `config.py` напрямую):
 
 ```bash
-export BOT_TOKEN="7963460886:AAE5EHWEwmuiOMijUnBQEg7VTHxwgTRF3u4"
+export BOT_TOKEN=728282727:GvJhgGHhj....."
 export CREATOR_ID="6140351301"
 export GOOGLE_CREDENTIALS_PATH="/путь/к/credentials.json"
 export GOOGLE_SHEET_ID="ID_вашей_гугл_таблицы"
