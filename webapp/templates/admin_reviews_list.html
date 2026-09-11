@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ label }}</h1>
+{% if not items %}
+<div class="alert warn">Заявок нет.</div>
+{% else %}
+<div class="panel">
+  {% for a in items %}
+  <div class="row">
+    <span class="k">{{ a.get('NickName') }}</span>
+    <span class="v"><a href="/admin/reviews/{{ app_type }}/{{ a['ID'] }}">открыть #{{ a['ID'] }}</a></span>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

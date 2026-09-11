@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>👥 Список пользователей</h1>
+<div class="panel">
+  <table class="table">
+    <tr><th>NickName</th><th>Роль</th><th>Организация</th><th>Telegram ID</th></tr>
+    {% for u in targets %}
+    <tr>
+      <td>{{ u.nickname }}</td>
+      <td>{{ role_name(u.role) }}</td>
+      <td>{{ u.org or '—' }}</td>
+      <td>{{ u.telegram_id }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

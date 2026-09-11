@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ nick }} — {{ date_ru }}</h1>
+
+<div class="panel">
+  {% if log_entry %}
+    <div class="row"><span class="k">Статус</span><span class="v">{{ log_entry.get('Status') }}</span></div>
+    <div class="row"><span class="k">Баллы</span><span class="v">{{ log_entry.get('Points') }}</span></div>
+    <div class="row"><span class="k">Работы</span><span class="v">{{ log_entry.get('WorksDone') }}</span></div>
+    {% set photo_ids = (log_entry.get('PhotoFileIDs') or '').split(',') %}
+    {% if photo_ids and photo_ids[0] %}
+    <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+      {% for fid in photo_ids %}
+      {% if fid %}
+      <img src="/media/tg/{{ fid }}" alt="скрин" style="max-width:220px; border-radius:8px; border:1px solid var(--border);">
+      {% endif %}
+      {% endfor %}
+    </div>
+    {% endif %}
+  {% elif not cell.sheet_exists %}
+    <p style="color:var(--text-dim);">За эту неделю листа в таблице ещё нет — данных нет.</p>
+  {% elif cell.value == "-" %}
+    <p>🟣 Неактив (одобренная заявка) — не считается ни за, ни против.</p>
+  {% elif cell.value %}
+    <p>✅ Отметка в таблице: <b>{{ cell.value }}</b> баллов (без подробного лога — возможно, начислено вручную).</p>
+  {% else %}
+    <p>⛔ Ничего не сдано за этот день.</p>
+  {% endif %}
+</div>
+
+<a href="/admin/reports/{{ org }}/{{ nick }}" class="btn secondary">← Назад к списку дат</a>
+{% endblock %}

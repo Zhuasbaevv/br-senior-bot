@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>➖️ Удалить пользователя</h1>
+
+{% if result %}
+<div class="alert ok">✅ Пользователь {{ result.nickname }} удалён.</div>
+{% endif %}
+
+{% if not targets %}
+<div class="alert warn">Список пуст.</div>
+{% else %}
+<div class="panel">
+  <form method="post">
+    <label>Кого удалить</label>
+    <select name="nickname" required>
+      {% for t in targets %}<option value="{{ t.nickname }}">{{ t.nickname }} ({{ role_name(t.role) }}{% if t.org %}, {{ t.org }}{% endif %})</option>{% endfor %}
+    </select>
+    <label>Причина снятия</label>
+    <textarea name="reason" required></textarea>
+    <div style="margin-top:18px;">
+      <button class="btn danger" type="submit">Удалить</button>
+    </div>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Снятие наказаний</h1>
+
+{% if result %}
+<div class="alert ok">
+  ✅ Заявка успешно отправлена руководству!<br>
+  Наказание: {{ result.punishment_type }}
+</div>
+{% elif not options %}
+<div class="alert warn">У вас нет наказаний.</div>
+{% else %}
+<div class="panel">
+  <form method="post">
+    <label>Какое наказание хотите снять?</label>
+    <select name="punishment_type" required>
+      {% for opt in options %}<option value="{{ opt }}">{{ opt }}</option>{% endfor %}
+    </select>
+    <label>Ссылка на доказательства (imgur.com или другой фотохостинг)</label>
+    <input type="url" name="proof_url" required>
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Отправить заявку</button>
+    </div>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

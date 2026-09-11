@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>🌐 Сравнение IP-адресов</h1>
+
+{% if error %}
+<p style="color:#f66;">{{ error }}</p>
+{% endif %}
+
+<div class="panel">
+  <form method="post" action="/tools/ip" style="display:flex;gap:12px;flex-wrap:wrap;">
+    <input name="ip1" placeholder="IP 1" required value="{{ ip1 or '' }}"
+           style="flex:1;min-width:180px;padding:10px;border-radius:6px;border:1px solid var(--border,#444);background:var(--bg-input,#1b1f24);color:inherit;">
+    <input name="ip2" placeholder="IP 2" required value="{{ ip2 or '' }}"
+           style="flex:1;min-width:180px;padding:10px;border-radius:6px;border:1px solid var(--border,#444);background:var(--bg-input,#1b1f24);color:inherit;">
+    <button type="submit"
+            style="padding:10px 20px;border-radius:6px;border:none;background:#5865f2;color:#fff;cursor:pointer;">
+      Сравнить
+    </button>
+  </form>
+</div>
+
+{% if result %}
+<div class="panel">
+  <h2>IP 1: {{ result.d1.query }}</h2>
+  <div class="row"><span class="k">Страна</span><span class="v">{{ result.d1.country or "??" }}</span></div>
+  <div class="row"><span class="k">Город</span><span class="v">{{ result.d1.city or "??" }}</span></div>
+  <div class="row"><span class="k">Провайдер</span><span class="v">{{ result.d1.isp or "??" }}</span></div>
+  <div class="row"><span class="k">Доп.инфа</span><span class="v">{{ result.d1.as or "??" }}</span></div>
+  <div class="row">
+    <span class="k">VPN</span>
+    <span class="v">{{ "Detected" if (result.d1.proxy or result.d1.hosting) else "None" }}</span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>IP 2: {{ result.d2.query }}</h2>
+  <div class="row"><span class="k">Страна</span><span class="v">{{ result.d2.country or "??" }}</span></div>
+  <div class="row"><span class="k">Город</span><span class="v">{{ result.d2.city or "??" }}</span></div>
+  <div class="row"><span class="k">Провайдер</span><span class="v">{{ result.d2.isp or "??" }}</span></div>
+  <div class="row"><span class="k">Доп.инфа</span><span class="v">{{ result.d2.as or "??" }}</span></div>
+  <div class="row">
+    <span class="k">VPN</span>
+    <span class="v">{{ "Detected" if (result.d2.proxy or result.d2.hosting) else "None" }}</span>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="row"><span class="k">Расстояние</span><span class="v">{{ result.dist_fmt }} км</span></div>
+  <img src="{{ result.map_url }}" alt="map" style="max-width:100%;border-radius:8px;margin-top:12px;">
+</div>
+{% endif %}
+{% endblock %}

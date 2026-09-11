@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Отчётности — {{ org }}</h1>
+{% if not nicks %}
+<div class="alert warn">В организации пока никого нет.</div>
+{% else %}
+<div class="grid-links">
+  {% for n in nicks %}
+  <a class="card" href="/admin/reports/{{ org }}/{{ n }}"><span class="label">{{ n }}</span></a>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

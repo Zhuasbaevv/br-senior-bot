@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>👮 Состав</h1>
+<p style="color:var(--text-dim); font-size:13px;">
+  На сайте нет живого статуса "в игре" (это внутренняя память самого бота) — здесь
+  показан полный состав по организациям.
+</p>
+{% for org, members in grouped.items() %}
+<div class="panel">
+  <h2>{{ org }}</h2>
+  {% if members %}
+    {% for m in members %}
+    <div class="row"><span class="k">{{ m.nickname }}</span><span class="v">{{ role_name(m.role) }}</span></div>
+    {% endfor %}
+  {% else %}
+    <div class="row"><span class="v" style="color:var(--text-dim);">Никого нет</span></div>
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}

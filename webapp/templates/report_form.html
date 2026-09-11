@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>📋 Отчёт</h1>
+
+{% if result %}
+  {% if result.error %}
+    <div class="alert error">{{ result.error }}</div>
+  {% else %}
+    {% if result.sheet_write_ok %}
+      <div class="alert ok">
+        ✅ Отчёт успешно отправлен.<br>
+        📌 Статус: {{ result.status }}<br>
+        ⭐ Начислено баллов: {{ result.points }}
+      </div>
+    {% else %}
+      <div class="alert warn">
+        ⚠️ Отчёт распознан (статус: {{ result.status }}, баллы: {{ result.points }}), НО не удалось
+        найти вас в текущей таблице — баллы НЕ записаны. Об этом уже уведомлены следящие и создатель.
+      </div>
+    {% endif %}
+    <div class="panel">
+      {% for r in result.reasons %}<div class="row"><span class="v">{{ loop.index }}. {{ r }}</span></div>{% endfor %}
+    </div>
+  {% endif %}
+{% endif %}
+
+<div class="panel">
+  <p style="color:var(--text-dim); font-size:13.5px; margin-top:0;">
+    Прикрепите скриншоты ваших работ. На каждом скрине должны быть видны дата и время
+    внизу справа, иначе он не будет засчитан.
+  </p>
+  <form method="post" enctype="multipart/form-data">
+    <label>Скриншоты</label>
+    <input type="file" name="photos" accept="image/*" multiple required>
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Отправить отчёт</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

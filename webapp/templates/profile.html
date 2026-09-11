@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>👱 Моя статистика</h1>
+
+<div class="panel">
+  <h2>📌 Основная информация</h2>
+  <div class="row"><span class="k">Должность</span><span class="v">{{ position }}</span></div>
+  <div class="row"><span class="k">Добавил</span><span class="v">{{ profile.get('AddedBy', '—') }}</span></div>
+  <div class="row"><span class="k">Дата назначения</span><span class="v">{{ added_date }}</span></div>
+  <div class="row"><span class="k">Общее количество дней</span><span class="v">{{ stat.get('Общее количество дней', '0') }}</span></div>
+  <div class="row"><span class="k">Организация</span><span class="v">{{ user.org or '—' }}</span></div>
+  <div class="row"><span class="k">Возраст</span><span class="v">{{ profile.get('Age', '—') }}</span></div>
+  <div class="row"><span class="k">Часовой пояс</span><span class="v">{{ profile.get('Timezone', '—') }}</span></div>
+</div>
+
+<div class="panel">
+  <h2>📞 Контакты</h2>
+  <div class="row"><span class="k">ВК</span><span class="v">{{ profile.get('VK', '—') }}</span></div>
+  <div class="row"><span class="k">Форум</span><span class="v">{{ profile.get('Forum', '—') }}</span></div>
+  <div class="row"><span class="k">Почта</span><span class="v">{{ profile.get('Email', '—') }}</span></div>
+  <div class="row"><span class="k">Discord ID</span><span class="v">{{ profile.get('DiscordID', '—') }}</span></div>
+  <div class="row"><span class="k">Telegram ID</span><span class="v">{{ user.telegram_id }}</span></div>
+  <div class="row"><span class="k">Telegram Username</span><span class="v">{{ profile.get('TelegramUsername', '—') }}</span></div>
+</div>
+
+<div class="panel">
+  <h2>🏃 Успеваемость</h2>
+  <div class="row"><span class="k">Баллы</span><span class="v">{{ stat.get('Баллы', '0') }}</span></div>
+</div>
+
+<div class="panel">
+  <h2>😡 Наказания</h2>
+  <div class="row"><span class="k">Выговоры</span><span class="v">{{ stat.get('Строгие выговоры', '0') }}</span></div>
+  <div class="row"><span class="k">Предупреждения</span><span class="v">{{ stat.get('Предупреждения', '0') }}</span></div>
+  <div class="row"><span class="k">Устники</span><span class="v">{{ stat.get('Устные выговоры', '0') }}</span></div>
+</div>
+{% endblock %}

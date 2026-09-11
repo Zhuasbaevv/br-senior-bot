@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Заявки</h1>
+<div class="grid-links">
+  {% for t, label in labels.items() %}
+  <a class="card" href="/admin/reviews/{{ t }}">
+    <span class="label">{{ label }} ({{ counts.get(t, 0) }})</span>
+  </a>
+  {% endfor %}
+</div>
+{% endblock %}

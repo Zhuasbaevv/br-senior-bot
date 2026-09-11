@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Вход — BR Management</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-card">
+      <div class="brand">BR Management</div>
+      <h1 style="font-size:18px;">Добро пожаловать</h1>
+      <p style="color:var(--text-dim); font-size:13.5px;">
+        Войдите в свой аккаунт для продолжения
+      </p>
+
+      {% if error %}
+      <div class="alert error">{{ error }}</div>
+      {% endif %}
+
+      <form method="post" style="margin-top:20px; text-align:left;">
+        <label>ВКонтакте ID</label>
+        <input type="text" name="vk_id" placeholder="Ваш VK ID..." required autofocus>
+        <label>Пароль</label>
+        <input type="password" name="password" placeholder="Введите пароль..." required>
+        <div style="margin-top:20px;">
+          <button class="btn" type="submit" style="width:100%;">Войти</button>
+        </div>
+      </form>
+
+      <p style="color:var(--text-dim); font-size:12px; margin-top:20px;">
+        Нет пароля? Отправьте боту команду <code style="font-family:var(--mono);">/setpassword ваш_пароль</code>.
+        VK ID указывался при верификации в боте.
+      </p>
+    </div>
+  </div>
+</body>
+</html>
