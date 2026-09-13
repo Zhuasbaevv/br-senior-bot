@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Выдать доступ</h1>
+
+{% if result %}
+<div class="alert ok">
+  ✅ {{ result.nickname }} назначен(а) на роль «{{ result.role }}» ({{ result.org }}).
+</div>
+{% endif %}
+
+{% if not candidates %}
+<div class="alert warn">Некому выдавать доступ.</div>
+{% else %}
+<div class="panel">
+  <form method="post">
+    <label>Кому</label>
+    <select name="nickname" required>
+      {% for c in candidates %}<option value="{{ c.nickname }}">{{ c.nickname }} ({{ role_name(c.role) }})</option>{% endfor %}
+    </select>
+    <label>Роль</label>
+    <select name="role_value" required>
+      <option value="{{ Role.STAFF.value }}">Старший состав</option>
+      <option value="{{ Role.LEADER.value }}">Лидер</option>
+      <option value="{{ Role.WATCHER.value }}">Следящий</option>
+      {% if allow_senior_watcher %}
+      <option value="{{ Role.SENIOR_WATCHER.value }}">Старший следящий</option>
+      {% endif %}
+    </select>
+    <label>Организация / группа</label>
+    <select name="org_or_group" required>
+      {% if allow_senior_watcher %}
+      {% for g in senior_groups %}<option value="{{ g }}">{{ g }} (для роли «Старший следящий»)</option>{% endfor %}
+      {% endif %}
+      {% for o in orgs %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
+    </select>
+    <p style="color:var(--text-dim); font-size:12.5px;">
+      Если выбираешь роль «Старший следящий» — выбери группу выше (Соц/Силовые/ОПГ).
+      Для остальных ролей — выбери конкретную организацию.
+    </p>
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Выдать</button>
+    </div>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

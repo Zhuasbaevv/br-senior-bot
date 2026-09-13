@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Неактив</h1>
+
+{% if result %}
+<div class="alert ok">
+  ✅ Ваша заявка была успешно отправлена руководству!<br>
+  Даты неактива: {{ result.dates }}<br>
+  Причина: {{ result.reason }}
+</div>
+{% endif %}
+
+<div class="panel">
+  <form method="post">
+    <label>Дата начала</label>
+    <input type="date" name="start_date" required>
+    <label>Дата окончания</label>
+    <input type="date" name="end_date" required>
+    <label>Причина</label>
+    <textarea name="reason" required></textarea>
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Отправить заявку</button>
+    </div>
+  </form>
+</div>
+{% endblock %}
