@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Назначить руководство</h1>
+
+{% if result %}
+<div class="alert ok">✅ {{ result.nickname }} назначен(а) руководством.</div>
+{% endif %}
+
+{% if not candidates %}
+<div class="alert warn">Некого назначать.</div>
+{% else %}
+<div class="panel">
+  <form method="post">
+    <label>Кого назначить</label>
+    <select name="nickname" required>
+      {% for c in candidates %}<option value="{{ c.nickname }}">{{ c.nickname }} ({{ role_name(c.role) }})</option>{% endfor %}
+    </select>
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Назначить</button>
+    </div>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

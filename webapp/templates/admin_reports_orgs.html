@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Отчётности</h1>
+<div class="grid-links">
+  {% for o in orgs %}
+  <a class="card" href="/admin/reports/{{ o }}"><span class="label">{{ o }}</span></a>
+  {% endfor %}
+</div>
+{% endblock %}

@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>📝 {{ quiz.Title }}</h1>
+<div class="alert warn">
+  Пока тест не пройден до конца, сайтом пользоваться нельзя. Не сворачивайте вкладку и не
+  переключайтесь на другую — это будет замечено и попытка не засчитается.
+</div>
+
+<style>
+  .quiz-progress { font-family: var(--mono); font-size: 12px; color: var(--text-dim); margin-bottom: 10px; }
+  .quiz-step { display: none; }
+  .quiz-step.active { display: block; }
+  .quiz-q { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+  .quiz-q .num { font-family: var(--mono); color: var(--accent); font-size: 13px; margin-bottom: 8px; }
+  .quiz-q .text { font-size: 16px; font-weight: 600; margin-bottom: 16px; }
+  .quiz-nav { display: flex; justify-content: flex-end; margin-top: 16px; }
+</style>
+
+<form method="post" action="/quiz/{{ quiz_id }}/submit" id="quiz-form">
+  <div class="quiz-progress" id="quiz-progress"></div>
+
+  {% for q in questions %}
+  <div class="quiz-step {% if loop.first %}active{% endif %}" data-step="{{ loop.index0 }}">
+    <div class="quiz-q">
+      <div class="num">Вопрос {{ loop.index }} из {{ questions | length }}</div>
+      <div class="text">{{ q }}</div>
+      <label>Ваш ответ</label>
+      <textarea name="answer_{{ loop.index0 }}" required></textarea>
+    </div>
+    <div class="quiz-nav">
+      {% if not loop.last %}
+      <button type="button" class="btn" onclick="nextStep()">Следующий вопрос →</button>
+      {% else %}
+      <button type="submit" class="btn">Готово</button>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</form>
+
+<script>
+const QUIZ_ID = {{ quiz_id }};
+let currentStep = 0;
+const steps = document.querySelectorAll('.quiz-step');
+
+function showStep(i) {
+  steps.forEach((el, idx) => el.classList.toggle('active', idx === i));
+  document.getElementById('quiz-progress').textContent = 'Вопрос ' + (i + 1) + ' из ' + steps.length;
+  currentStep = i;
+}
+
+function nextStep() {
+  const cur = steps[currentStep];
+  const ta = cur.querySelector('textarea');
+  if (ta && !ta.value.trim()) {
+    ta.focus();
+    return;
+  }
+  if (currentStep < steps.length - 1) showStep(currentStep + 1);
+}
+
+showStep(0);
+
+// ---- Антисписывание: свернул вкладку/переключился на другую — тест сбрасывается ----
+let violationSent = false;
+function reportViolation() {
+  if (violationSent) return;
+  violationSent = true;
+  try {
+    navigator.sendBeacon('/quiz/' + QUIZ_ID + '/violation', new Blob([], {type: 'text/plain'}));
+  } catch (e) {
+    fetch('/quiz/' + QUIZ_ID + '/violation', { method: 'POST', keepalive: true }).catch(() => {});
+  }
+  window.location.href = '/profile';
+}
+
+document.addEventListener('visibilitychange', function () {
+  // document.hidden === true означает, что страница реально ушла в фон -
+  // свернули приложение/переключились на другую вкладку и остались там.
+  // Раньше здесь был ещё и window 'blur' - его убрал: на телефонах blur
+  // срабатывает и от простого открытия/закрытия клавиатуры при наборе
+  // ответа в textarea, что давало ложные срабатывания при обычном
+  // прохождении теста.
+  if (document.hidden) reportViolation();
+});
+</script>
+{% endblock %}

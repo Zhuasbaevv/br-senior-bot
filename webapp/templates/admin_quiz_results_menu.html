@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>📊 Результаты тестов</h1>
+
+{% if not quizzes %}
+<div class="alert warn">Пока нет тестов, назначенных вашей зоне ответственности.</div>
+{% else %}
+<div class="panel">
+  <table class="table">
+    <tr><th>ID</th><th>Название</th><th>Создал</th><th>Организации</th><th>Создан</th><th></th></tr>
+    {% for q in quizzes %}
+    <tr>
+      <td>#{{ q.ID }}</td>
+      <td>{{ q.Title }}</td>
+      <td>{{ q.CreatedBy }} ({{ q.CreatedByRole }})</td>
+      <td>{{ q.Scope | replace('[', '') | replace(']', '') | replace('"', '') }}</td>
+      <td>{{ q.CreatedAt }}</td>
+      <td><a href="/admin/quizzes/results/{{ q.ID }}">Открыть →</a></td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>➕ Создать тест</h1>
+
+{% if result and result.error %}
+<div class="alert warn">❌ {{ result.error }}</div>
+{% elif result and result.ok %}
+<div class="alert ok">
+  ✅ Тест #{{ result.quiz_id }} создан и уже назначен: {{ result.orgs | join(", ") }}.
+  Люди увидят его сразу при следующем входе на сайт.
+</div>
+{% endif %}
+
+<style>
+  .q-block { position: relative; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 14px 40px 14px 14px; margin-bottom: 12px; }
+  .q-block .q-del { position: absolute; top: 10px; right: 10px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); border-radius: 6px; width: 26px; height: 26px; cursor: pointer; font-size: 13px; line-height: 1; }
+  .q-block .q-del:hover { color: var(--danger); border-color: var(--danger); }
+  .q-block label { margin-top: 0; }
+  .scope-note { font-size: 13px; color: var(--text-dim); margin: 8px 0 4px; }
+  .radio-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 14px; }
+  .radio-row input { width: auto; }
+</style>
+
+<div class="panel">
+  <form method="post" id="quiz-form">
+    <label>Название теста (необязательно)</label>
+    <input type="text" name="title" placeholder="Например: Аттестация по правилам">
+
+    {% if scope.mode == "watcher" %}
+      <p class="scope-note">Тест будет виден только вашей организации: <b>{{ scope.org }}</b></p>
+      <input type="hidden" name="scope_choice" value="org">
+      <input type="hidden" name="scope_value" value="{{ scope.org }}">
+    {% elif scope.mode == "senior_watcher" %}
+      <label>Кому назначить тест</label>
+      <div class="radio-row"><input type="radio" name="scope_choice" value="group" id="sc-group" checked><label for="sc-group" style="margin:0;">Всему направлению «{{ scope.group_name }}» ({{ scope.orgs | join(", ") }})</label></div>
+      <div class="radio-row"><input type="radio" name="scope_choice" value="org" id="sc-org"><label for="sc-org" style="margin:0;">Отдельной организации</label></div>
+      <select name="scope_value" id="sc-org-select" disabled>
+        {% for o in scope.orgs %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
+      </select>
+    {% else %}
+      <label>Кому назначить тест</label>
+      <div class="radio-row"><input type="radio" name="scope_choice" value="all" id="sc-all" checked><label for="sc-all" style="margin:0;">Всем организациям</label></div>
+      <div class="radio-row"><input type="radio" name="scope_choice" value="group" id="sc-group"><label for="sc-group" style="margin:0;">По направлению</label></div>
+      <div class="radio-row"><input type="radio" name="scope_choice" value="org" id="sc-org"><label for="sc-org" style="margin:0;">По отдельной организации</label></div>
+      <select name="scope_value" id="sc-group-select" disabled>
+        {% for g in scope.groups %}<option value="{{ g }}">{{ g }}</option>{% endfor %}
+      </select>
+      <select name="scope_value" id="sc-org-select-2" disabled>
+        {% for o in scope.orgs %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
+      </select>
+    {% endif %}
+
+    <h2 style="margin-top:22px;">Вопросы</h2>
+    <div id="questions">
+      <div class="q-block">
+        <button type="button" class="q-del" onclick="removeQ(this)">✕</button>
+        <label>Вопрос 1</label>
+        <textarea name="question" required placeholder="Например: Со скольки до скольки можно грабить?"></textarea>
+      </div>
+    </div>
+    <button type="button" class="btn secondary" onclick="addQ()">+ Вопрос</button>
+
+    <div style="margin-top:22px;">
+      <button class="btn" type="submit">Готово</button>
+    </div>
+  </form>
+</div>
+
+<script>
+function relabel() {
+  document.querySelectorAll('#questions .q-block label').forEach((el, i) => {
+    el.textContent = 'Вопрос ' + (i + 1);
+  });
+}
+function addQ() {
+  const wrap = document.getElementById('questions');
+  const block = document.createElement('div');
+  block.className = 'q-block';
+  block.innerHTML = '<button type="button" class="q-del" onclick="removeQ(this)">✕</button>' +
+    '<label>Вопрос</label><textarea name="question" placeholder="Текст вопроса"></textarea>';
+  wrap.appendChild(block);
+  relabel();
+}
+function removeQ(btn) {
+  const wrap = document.getElementById('questions');
+  if (wrap.children.length <= 1) return; // хотя бы один вопрос должен остаться
+  btn.closest('.q-block').remove();
+  relabel();
+}
+
+// Переключение радиокнопок области действия — отключаем неактуальный <select>,
+// чтобы браузер его вообще не отправил (disabled-поля не попадают в form-data),
+// а сервер получил ровно то, что видно на экране.
+(function () {
+  const radios = document.querySelectorAll('input[name="scope_choice"]');
+  if (!radios.length) return;
+  const singleOrgSelect = document.getElementById('sc-org-select');   // старший следящий
+  const groupSelect = document.getElementById('sc-group-select');     // руководство
+  const orgSelect2 = document.getElementById('sc-org-select-2');      // руководство
+  function refresh() {
+    const checked = document.querySelector('input[name="scope_choice"]:checked');
+    if (!checked) return;
+    if (singleOrgSelect) singleOrgSelect.disabled = checked.value !== 'org';
+    if (groupSelect) groupSelect.disabled = checked.value !== 'group';
+    if (orgSelect2) orgSelect2.disabled = checked.value !== 'org';
+  }
+  radios.forEach(r => r.addEventListener('change', refresh));
+  refresh();
+})();
+</script>
+{% endblock %}

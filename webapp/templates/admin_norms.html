@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Настроить нормативы</h1>
+
+{% if result %}
+<div class="alert ok">
+  ✅ Норматив для {{ result.org }} / ранг {{ result.rank }} сохранён.
+</div>
+{% endif %}
+
+<div class="panel">
+  <h2>Текущие нормативы</h2>
+  {% if norms %}
+  <table class="table">
+    <tr><th>Орг.</th><th>Ранг</th><th>ВЧ</th><th>Собес</th><th>Лекции</th><th>Тренировки</th><th>РП</th><th>Онлайн, ч</th></tr>
+    {% for n in norms %}
+    <tr>
+      <td>{{ n.get('Org') }}</td>
+      <td>{{ n.get('Rank') }}</td>
+      <td>{{ n.get('VCH') }}</td>
+      <td>{{ n.get('Interview') }}</td>
+      <td>{{ n.get('Lecture') }}</td>
+      <td>{{ n.get('Training') }}</td>
+      <td>{{ n.get('RP') }}</td>
+      <td>{{ n.get('OnlineHours') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p style="color:var(--text-dim);">Нормативы пока не настроены ни для одной организации.</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>Добавить / изменить норматив</h2>
+  <form method="post">
+    <label>Организация</label>
+    <select name="org" required>
+      {% for o in orgs %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
+    </select>
+    <label>Ранг</label>
+    <select name="rank" required>
+      {% for r in ranks %}<option value="{{ r }}">Ранг {{ r }}</option>{% endfor %}
+    </select>
+    <label>Поход на ВЧ</label>
+    <input type="number" name="vch" value="0" min="0" required>
+    <label>Собеседования</label>
+    <input type="number" name="interview" value="0" min="0" required>
+    <label>Лекции</label>
+    <input type="number" name="lecture" value="0" min="0" required>
+    <label>Тренировки</label>
+    <input type="number" name="training" value="0" min="0" required>
+    <label>РП ситуации</label>
+    <input type="number" name="rp" value="0" min="0" required>
+    <label>Онлайн, часов (можно дробное)</label>
+    <input type="number" name="online_hours" value="0" min="0" step="0.1" required>
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Сохранить</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

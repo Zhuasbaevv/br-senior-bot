@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Отчёты — {{ nick }}</h1>
+
+<div class="panel">
+  <h2>Дни (последние 30)</h2>
+  <div style="display:flex; gap:6px; flex-wrap:wrap;">
+    {% for d in last_30_days %}
+    <a href="/admin/reports/{{ org }}/{{ nick }}/day/{{ d.iso }}" class="btn secondary" style="padding:6px 10px; font-size:12.5px;">{{ d.label }}</a>
+    {% endfor %}
+  </div>
+</div>
+
+{% if not reports %}
+<div class="alert warn">У {{ nick }} пока нет сданных отчётов.</div>
+{% else %}
+{% for r in reports %}
+<div class="panel">
+  <div class="row"><span class="k">Дата</span><span class="v">{{ r.get('ReportDate') }}</span></div>
+  <div class="row"><span class="k">Статус</span><span class="v">{{ r.get('Status') }}</span></div>
+  <div class="row"><span class="k">Баллы</span><span class="v">{{ r.get('Points') }}</span></div>
+  <div class="row"><span class="k">Работы</span><span class="v">{{ r.get('WorksDone') }}</span></div>
+  {% set photo_ids = (r.get('PhotoFileIDs') or '').split(',') %}
+  {% if photo_ids and photo_ids[0] %}
+  <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;">
+    {% for fid in photo_ids %}
+    {% if fid %}
+    <img src="/media/tg/{{ fid }}" alt="скрин" style="max-width:220px; border-radius:8px; border:1px solid var(--border);">
+    {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+{% endblock %}
