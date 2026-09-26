@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Отчётности</h1>
+<p style="margin-bottom:14px;"><a class="btn" href="/admin/reports-export.xlsx">⬇️ Скачать текущую неделю в Excel</a></p>
+<div class="grid-links">
+  {% for o in orgs %}
+  <a class="card" href="/admin/reports/{{ o }}"><span class="label">{{ o }}</span></a>
+  {% endfor %}
+</div>
+{% endblock %}

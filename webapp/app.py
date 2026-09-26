@@ -1,0 +1,1863 @@
+"""
+Веб-панель BR | Server Manager.
+
+Работает ПАРАЛЛЕЛЬНО с Telegram-ботом, не вместо него: та же Google-таблица,
+та же система ролей (utils.access), тот же канал логов. Уведомления, которые
+должны прийти человеку в Telegram (одобрения/отказы, алерт о повторном скрине
+и т.д.), сайт отправляет через тот же bot-инстанс, что и раньше — просто
+действие теперь можно инициировать и с сайта, а не только из бота.
+
+Деплой: второй Railway-сервис из ТОГО ЖЕ репозитория, команда запуска:
+    uvicorn webapp.app:app --host 0.0.0.0 --port $PORT
+(см. webapp/README.md за подробностями).
+"""
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import hashlib
+import json
+import math
+
+from aiogram import Bot
+from aiogram.types import BufferedInputFile
+from fastapi import FastAPI, Request, Depends, Form, UploadFile, File, Header, HTTPException
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from config import (
+    BOT_TOKEN, Role, ALL_ORGS, ROLE_NAMES, CREATOR_ID, CREATOR_TEST_NORM,
+    ACTIVITY_LABELS, REPORT_STATUS_NO_NORM, PUNISHMENT_TYPES, PUNISHMENT_SHEET_COL, MSK_TZ, LOG_CHANNEL_ID,
+    SENIOR_GROUPS, INTERNAL_API_SECRET, SITE_BRIDGE_SECRET, RANKS,
+    VAPID_PUBLIC_KEY,
+    SHEET_LOG_ACCESS, SHEET_LOG_PUNISH, SHEET_LOG_POINTS, SHEET_LOG_EXTRA, SHEET_LOG_MODERATION,
+)
+from utils.access import (
+    get_user, set_user, all_users, load_all_users, managers_for_org, role_name, UserInfo,
+    can_manage, manageable_users, max_grantable_role, visible_orgs,
+)
+from utils.passwords import verify_password
+from utils.runtime_settings import get_webapp_url, set_webapp_url, get_info_text, set_info_text
+from services.sheets import get_sheets
+from services import vk_bridge
+from services import push
+from services.ai_ocr import analyze_report_album, score_report
+from webapp.auth import create_session_cookie_value, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS
+from webapp.nav import nav_sections, get_current_user, get_optional_user, RedirectToLogin, RedirectToQuiz
+from webapp import db as pwdb
+from ip import get_ip_info  # та же логика сравнения IP, что и в Telegram-команде /ip
+
+app = FastAPI(title="BR Management")
+app.mount("/static", StaticFiles(directory="webapp/static"), name="static")
+templates = Jinja2Templates(directory="webapp/templates")
+templates.env.globals["Role"] = Role
+templates.env.globals["role_name"] = role_name
+
+
+@app.exception_handler(RedirectToLogin)
+async def _redirect_to_login(request: Request, exc: RedirectToLogin):
+    return RedirectResponse(f"/login{exc.query}")
+
+
+@app.exception_handler(RedirectToQuiz)
+async def _redirect_to_quiz(request: Request, exc: RedirectToQuiz):
+    return RedirectResponse(f"/quiz/{exc.quiz_id}")
+
+
+USER_CACHE_REFRESH_SECONDS = 60
+
+
+async def _refresh_users_loop() -> None:
+    """См. main.py бота — та же логика. Бот и сайт держат каждый свою копию
+    кэша ролей/доступа в памяти, и без периодического обновления доступ,
+    выданный на одной стороне, не был бы виден на другой без её перезапуска."""
+    while True:
+        await asyncio.sleep(USER_CACHE_REFRESH_SECONDS)
+        try:
+            await load_all_users()
+        except Exception:
+            pass
+
+
+@app.on_event("startup")
+async def on_startup():
+    bot = Bot(token=BOT_TOKEN)
+    app.state.bot = bot
+    get_sheets(bot)  # тот же bot-инстанс -> те же логи в LOG_CHANNEL_ID, что и у самого бота
+    await load_all_users()
+    asyncio.create_task(_refresh_users_loop())
+
+
+def _ctx(request: Request, user: UserInfo | None = None, **extra) -> dict:
+    base = {
+        "request": request,
+        "user": user,
+        "nav": nav_sections(user.role) if user else [],
+    }
+    base.update(extra)
+    return base
+
+
+def _client_fingerprint(request: Request) -> tuple[str, str, str]:
+    """(fingerprint, ip, user_agent) — грубая идентификация устройства/браузера
+    без JS (только по IP + User-Agent). Достаточно, чтобы заметить "вход с нового
+    браузера/устройства" — не защита от подмены заголовков, а сигнал для алерта."""
+    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
+        request.client.host if request.client else "unknown"
+    )
+    user_agent = request.headers.get("user-agent", "unknown")
+    fingerprint = hashlib.sha256(f"{ip}|{user_agent}".encode()).hexdigest()[:20]
+    return fingerprint, ip, user_agent
+
+
+# ============================================================ Авторизация (VK ID + пароль)
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    return templates.TemplateResponse("login.html", _ctx(request))
+
+
+@app.post("/login", response_class=HTMLResponse)
+async def login_submit(
+    request: Request,
+    vk_id: str = Form(...),
+    password: str = Form(...),
+):
+    vk_id = vk_id.strip()
+    locked_minutes = pwdb.check_login_lock(vk_id)
+    if locked_minutes:
+        return templates.TemplateResponse(
+            "login.html",
+            _ctx(request, error=f"Слишком много неудачных попыток входа. Попробуйте снова через {locked_minutes} мин."),
+        )
+
+    sheets = get_sheets()
+    profile = await _run(sheets.find_user_by_vk, vk_id)
+    error = None
+
+    if not profile:
+        error = "Неверный VK ID или пароль."
+    else:
+        telegram_id = int(profile.get("TelegramID", 0) or 0)
+        user = get_user(telegram_id)
+        if not user:
+            error = "У этого аккаунта нет доступа к системе — обратитесь к следящему."
+        elif not pwdb.has_password(telegram_id):
+            error = "Пароль для сайта ещё не установлен — задайте его в боте командой /setpassword."
+        else:
+            stored_hash = pwdb.get_password_hash(telegram_id)
+            if not verify_password(password, stored_hash):
+                error = "Неверный VK ID или пароль."
+
+    if error:
+        pwdb.register_login_fail(vk_id)
+        return templates.TemplateResponse("login.html", _ctx(request, error=error))
+
+    pwdb.reset_login_fails(vk_id)
+    fingerprint, ip, user_agent = _client_fingerprint(request)
+    is_new_device = not pwdb.is_known_device(telegram_id, fingerprint)
+    pwdb.remember_device(telegram_id, fingerprint, ip, user_agent)
+    pwdb.add_login_history(telegram_id, ip, user_agent)
+
+    if is_new_device:
+        try:
+            bot: Bot = app.state.bot
+            await bot.send_message(
+                telegram_id,
+                f"🔐 Обнаружен вход в веб-панель с нового устройства/браузера.\n\n"
+                f"IP: {ip}\nUser-Agent: {user_agent}\n\n"
+                f"Если это были не вы — срочно смените пароль через /setpassword "
+                f"или сообщите создателю, чтобы он сбросил вам пароль.",
+            )
+        except Exception:
+            pass
+
+    resp = RedirectResponse("/profile", status_code=303)
+    resp.set_cookie(
+        SESSION_COOKIE_NAME,
+        create_session_cookie_value(telegram_id),
+        max_age=SESSION_MAX_AGE_SECONDS,
+        httponly=True,
+        samesite="lax",
+    )
+    return resp
+
+
+@app.get("/logout")
+async def logout():
+    resp = RedirectResponse("/login")
+    resp.delete_cookie(SESSION_COOKIE_NAME)
+    return resp
+
+
+# ============================================================ Внутренний API (только бот -> сайт)
+@app.post("/internal/set-password")
+async def internal_set_password(request: Request, x_internal_secret: str = Header(default="")):
+    if not INTERNAL_API_SECRET or x_internal_secret != INTERNAL_API_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    body = await request.json()
+    telegram_id = int(body["telegram_id"])
+    password_hash = str(body["password_hash"])
+    pwdb.set_password_hash(telegram_id, password_hash)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/internal/send-push")
+async def internal_send_push(request: Request, x_internal_secret: str = Header(default="")):
+    """Подписки на push хранятся в базе САЙТА — бот (отдельный процесс/сервис)
+    не может писать в них напрямую, поэтому шлёт запрос сюда."""
+    if not INTERNAL_API_SECRET or x_internal_secret != INTERNAL_API_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    body = await request.json()
+    telegram_id = int(body["telegram_id"])
+    title = str(body["title"])
+    push_body = str(body["body"])
+    url = str(body.get("url") or "/")
+    await _run(push.send_push_to_user, telegram_id, title, push_body, url)
+    return JSONResponse({"ok": True})
+
+
+# ============================================================ Внутренний API (VK-бот модерации -> сайт)
+@app.get("/internal/vk-profile")
+async def internal_vk_profile(vk_id: str, x_bridge_secret: str = Header(default="")):
+    """Для команды /stats в vk_moderation_bot — Должность и (для Старшего
+    состава) Ранг человека, найденного по его VK ID в листе «Пользователи».
+    Отдельный секрет (SITE_BRIDGE_SECRET) от /internal/set-password —
+    это два разных сервиса-клиента, разумно не путать их доступы."""
+    if not SITE_BRIDGE_SECRET or x_bridge_secret != SITE_BRIDGE_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    sheets = get_sheets()
+    profile_row = await _run(sheets.find_user_by_vk, vk_id.strip())
+    if not profile_row:
+        return JSONResponse({"found": False})
+    role_str = profile_row.get("Role") or ""
+    rank = profile_row.get("Rank") if role_str == "Старший состав" else None
+    return JSONResponse({
+        "found": True,
+        "position": role_str or None,
+        "rank": str(rank) if rank not in (None, "") else None,
+        "org": profile_row.get("Org") or None,
+        "nickname": profile_row.get("NickName") or None,
+    })
+
+
+@app.get("/")
+async def root(user: UserInfo | None = Depends(get_optional_user)):
+    return RedirectResponse("/profile" if user else "/login")
+
+
+# ============================================================ Профиль
+@app.get("/admin/dashboard", response_class=HTMLResponse)
+async def admin_dashboard(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    sheets = get_sheets()
+    orgs = None if user.role >= Role.LEADERSHIP else visible_orgs(user)
+    data = await _run(sheets.dashboard_stats, orgs)
+    return templates.TemplateResponse("admin_dashboard.html", _ctx(request, user, data=data))
+
+
+@app.get("/profile", response_class=HTMLResponse)
+async def profile(request: Request, user: UserInfo = Depends(get_current_user)):
+    sheets = get_sheets()
+    profile_row = await _run(sheets.get_user_row, user.telegram_id)
+    profile_row = profile_row or {}
+
+    stat = {}
+    row_idx = await _run(sheets.find_nick_row, user.nickname)
+    if row_idx:
+        stat = await _run(sheets.get_stat_by_row, row_idx)
+
+    position = role_name(Role.CREATOR) if user.role == Role.CREATOR else stat.get("Должность", "—")
+    last_logins = pwdb.get_last_logins(user.telegram_id, limit=5)
+
+    return templates.TemplateResponse(
+        "profile.html",
+        _ctx(
+            request, user,
+            position=position,
+            profile=profile_row,
+            stat=stat,
+            added_date=profile_row.get("AddedDate") or stat.get("Дата назначения", "—"),
+            last_logins=last_logins,
+        ),
+    )
+
+
+async def _run(fn, *args, **kwargs):
+    import asyncio
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+# ============================================================ Web Push
+@app.get("/push/vapid-public-key")
+async def push_vapid_public_key():
+    return JSONResponse({"key": VAPID_PUBLIC_KEY})
+
+
+@app.post("/push/subscribe")
+async def push_subscribe(request: Request, user: UserInfo = Depends(get_current_user)):
+    body = await request.json()
+    endpoint = body.get("endpoint")
+    keys = body.get("keys") or {}
+    if not endpoint or not keys.get("p256dh") or not keys.get("auth"):
+        return JSONResponse({"ok": False}, status_code=400)
+    await _run(pwdb.save_push_subscription, user.telegram_id, endpoint, keys["p256dh"], keys["auth"])
+    return JSONResponse({"ok": True})
+
+
+@app.post("/push/unsubscribe")
+async def push_unsubscribe(request: Request, user: UserInfo = Depends(get_current_user)):
+    body = await request.json()
+    endpoint = body.get("endpoint")
+    if endpoint:
+        await _run(pwdb.remove_push_subscription, endpoint)
+    return JSONResponse({"ok": True})
+
+
+# ============================================================ Заявления
+@app.get("/applications", response_class=HTMLResponse)
+async def applications_menu(request: Request, user: UserInfo = Depends(get_current_user)):
+    today = dt.datetime.now(MSK_TZ).strftime("%d.%m.%Y")
+    return templates.TemplateResponse("applications_menu.html", _ctx(request, user, today=today))
+
+
+@app.get("/applications/report", response_class=HTMLResponse)
+async def report_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    return templates.TemplateResponse("report_form.html", _ctx(request, user, result=None))
+
+
+@app.post("/applications/report", response_class=HTMLResponse)
+async def report_submit(
+    request: Request,
+    user: UserInfo = Depends(get_current_user),
+    photos: list[UploadFile] = File(...),
+):
+    sheets = get_sheets()
+    bot: Bot = app.state.bot
+    report_date = dt.datetime.now(MSK_TZ).strftime("%d.%m.%Y")
+
+    if user.role != Role.CREATOR:
+        already = await _run(sheets.has_reported_on, user.nickname, report_date)
+        if already:
+            return templates.TemplateResponse(
+                "report_form.html",
+                _ctx(request, user, result={"error": f"Вы уже сдавали отчёт за {report_date}."}),
+            )
+
+    images: list[tuple[bytes, str]] = []
+    photo_hashes: list[str] = []
+    raw_files: list[bytes] = []
+    for f in photos:
+        data = await f.read()
+        if not data:
+            continue
+        images.append((data, f.content_type or "image/jpeg"))
+        photo_hashes.append(hashlib.sha256(data).hexdigest())
+        raw_files.append(data)
+
+    if not images:
+        return templates.TemplateResponse(
+            "report_form.html", _ctx(request, user, result={"error": "Прикрепите хотя бы один скриншот."})
+        )
+
+    try:
+        analysis = await analyze_report_album(images, report_date)
+    except Exception:
+        return templates.TemplateResponse(
+            "report_form.html",
+            _ctx(request, user, result={"error": "Не удалось распознать отчёт. Попробуйте скрины чётче."}),
+        )
+
+    profile_row = await _run(sheets.get_user_row, user.telegram_id) or {}
+    rank = int(float(profile_row.get("Rank") or 0)) if profile_row else 0
+    norm = await _run(sheets.get_norm, user.org, rank) if user.org and rank else None
+    if norm is None and user.role == Role.CREATOR:
+        norm = CREATOR_TEST_NORM
+    if norm is None:
+        return templates.TemplateResponse(
+            "report_form.html",
+            _ctx(request, user, result={"error": "Для вашей организации и ранга норматив ещё не настроен."}),
+        )
+
+    # Заливаем скрины в Telegram (в канал логов), чтобы получить file_id — дальше отчёт
+    # хранится и просматривается ("Отчётности" в боте) той же логикой, что и отчёты,
+    # сданные прямо в Telegram, независимо от того, откуда он реально пришёл.
+    photo_file_ids: list[str] = []
+    for i, data in enumerate(raw_files):
+        try:
+            msg = await bot.send_photo(
+                LOG_CHANNEL_ID,
+                BufferedInputFile(data, filename=f"web_report_{i}.jpg"),
+            )
+            photo_file_ids.append(msg.photo[-1].file_id)
+        except Exception:
+            pass
+
+    # Антидубль — та же проверка и тот же формат алерта, что при сдаче через бота.
+    duplicate_matches = await _run(sheets.find_duplicate_hashes, photo_hashes, user.telegram_id)
+    if duplicate_matches:
+        other_nicks = sorted({m.get("NickName", "?") for m in duplicate_matches})
+        alert_text = (
+            f"🚨 <b>ПОДОЗРЕНИЕ НА ПОВТОРНУЮ СДАЧУ СКРИНА</b>\n\n"
+            f"{user.nickname} сдал норматив (через сайт), скрин из которого ранее уже "
+            f"был отправлен ({', '.join(other_nicks)}) — скорее проверьте."
+        )
+        recipients = {u.telegram_id: u for u in managers_for_org(user.org)} if user.org else {}
+        recipients[CREATOR_ID] = None
+        for tid in recipients:
+            try:
+                await bot.send_message(tid, alert_text, parse_mode="HTML")
+            except Exception:
+                pass
+
+    points, status, reasons = score_report(analysis, norm)
+
+    row_idx = await _run(sheets.find_nick_row, user.nickname)
+    old_total = await _run(sheets.get_points, row_idx) if row_idx else 0.0
+    new_total = await _run(sheets.record_daily_points_by_date, user.nickname, report_date, float(points))
+    sheet_write_ok = new_total is not None
+    if new_total is None:
+        new_total = old_total
+
+    await sheets.log_points(
+        user.nickname, f"Отчёт (сайт) — {status}", points, old_total, new_total, "; ".join(reasons),
+    )
+    if status == REPORT_STATUS_NO_NORM:
+        await _run(sheets.bump_no_norm_day, user.nickname)
+
+    counts = analysis.get("counts", {})
+    works_parts = [f"{ACTIVITY_LABELS[k]}: {v}" for k, v in counts.items() if v and k in ACTIVITY_LABELS]
+    online_h = analysis.get("online_hours_today")
+    if online_h:
+        works_parts.append(f"Онлайн: {online_h}ч")
+    works_done = ", ".join(works_parts) if works_parts else "Ничего не распознано"
+
+    await sheets.log_report_submission(
+        user.telegram_id, user.nickname, user.org or "—", report_date, status, points,
+        works_done, photo_file_ids, photo_hashes,
+    )
+
+    result = {
+        "status": status, "points": points, "reasons": reasons,
+        "sheet_write_ok": sheet_write_ok,
+    }
+    return templates.TemplateResponse("report_form.html", _ctx(request, user, result=result))
+
+
+@app.get("/applications/inactive", response_class=HTMLResponse)
+async def inactive_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    return templates.TemplateResponse("inactive_form.html", _ctx(request, user, result=None))
+
+
+@app.post("/applications/inactive", response_class=HTMLResponse)
+async def inactive_submit(
+    request: Request,
+    user: UserInfo = Depends(get_current_user),
+    start_date: str = Form(...),
+    end_date: str = Form(...),
+    reason: str = Form(...),
+):
+    sheets = get_sheets()
+    dates = f"{start_date}/{end_date}"
+    app_id = await _run(sheets.create_application, "inactive", user.telegram_id, user.nickname, f"{dates}|{reason}")
+    await sheets.log_application_submitted("Неактив", user.nickname, user.org or "", f"#{app_id}: Даты: {dates}, Причина: {reason}")
+
+    bot: Bot = app.state.bot
+    for m in (managers_for_org(user.org) if user.org else []):
+        try:
+            await bot.send_message(
+                m.telegram_id, f"📩 Новая заявка «Неактив» #{app_id} от {user.nickname}\n\nДаты: {dates}\nПричина: {reason}"
+            )
+        except Exception:
+            pass
+
+    result = {"app_id": app_id, "dates": dates, "reason": reason}
+    return templates.TemplateResponse("inactive_form.html", _ctx(request, user, result=result))
+
+
+@app.get("/applications/extra-work", response_class=HTMLResponse)
+async def extra_work_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    return templates.TemplateResponse("extra_work_form.html", _ctx(request, user, result=None))
+
+
+@app.post("/applications/extra-work", response_class=HTMLResponse)
+async def extra_work_submit(
+    request: Request,
+    user: UserInfo = Depends(get_current_user),
+    description: str = Form(...),
+    photos: list[UploadFile] = File(...),
+):
+    sheets = get_sheets()
+    bot: Bot = app.state.bot
+    proof_file_ids: list[str] = []
+    for photo in photos:
+        data = await photo.read()
+        if not data:
+            continue
+        try:
+            msg = await bot.send_photo(
+                LOG_CHANNEL_ID, BufferedInputFile(data, filename="web_extra.jpg")
+            )
+            proof_file_ids.append(msg.photo[-1].file_id)
+        except Exception:
+            pass
+    proof = ",".join(proof_file_ids)
+
+    app_id = await _run(
+        sheets.create_application, "extra_work", user.telegram_id, user.nickname, f"{description}|{proof}"
+    )
+    await sheets.log_application_submitted("Доп.работа", user.nickname, user.org or "", f"#{app_id}: {description}")
+
+    for m in (managers_for_org(user.org) if user.org else []):
+        try:
+            await bot.send_message(m.telegram_id, f"📩 Новая заявка «Доп.работа» #{app_id} от {user.nickname}\n\nРабота: {description}")
+        except Exception:
+            pass
+
+    result = {"app_id": app_id, "description": description}
+    return templates.TemplateResponse("extra_work_form.html", _ctx(request, user, result=result))
+
+
+@app.get("/applications/remove-punishment", response_class=HTMLResponse)
+async def remove_punish_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    sheets = get_sheets()
+    row_idx = await _run(sheets.find_nick_row, user.nickname)
+    counts = {"L": 0, "M": 0, "N": 0}
+    if row_idx:
+        for col in counts:
+            counts[col] = await _run(sheets.get_punishment_count, row_idx, col)
+    options = []
+    if counts["L"]:
+        options.append("Выговор")
+    if counts["M"]:
+        options.append("Предупреждение")
+    if counts["N"]:
+        options.append("Устный выговор")
+    return templates.TemplateResponse(
+        "remove_punish_form.html", _ctx(request, user, options=options, result=None)
+    )
+
+
+@app.post("/applications/remove-punishment", response_class=HTMLResponse)
+async def remove_punish_submit(
+    request: Request,
+    user: UserInfo = Depends(get_current_user),
+    punishment_type: str = Form(...),
+    proof_url: str = Form(...),
+):
+    sheets = get_sheets()
+    app_id = await _run(
+        sheets.create_application, "remove_punish", user.telegram_id, user.nickname, f"{punishment_type}|{proof_url}"
+    )
+    await sheets.log_application_submitted(
+        "Снятие наказания", user.nickname, user.org or "", f"#{app_id}: {punishment_type}"
+    )
+
+    bot: Bot = app.state.bot
+    for m in (managers_for_org(user.org) if user.org else []):
+        try:
+            await bot.send_message(
+                m.telegram_id,
+                f"📩 Новая заявка «Снятие наказания» #{app_id} от {user.nickname}\n\nНаказание: {punishment_type}\nДоказательства: {proof_url}",
+            )
+        except Exception:
+            pass
+
+    result = {"app_id": app_id, "punishment_type": punishment_type}
+    return templates.TemplateResponse("remove_punish_form.html", _ctx(request, user, options=[], result=result))
+
+
+# ============================================================ Админ: пользователи
+def _visible_targets(user: UserInfo) -> list[UserInfo]:
+    """Кого user вправе видеть/администрировать (utils.access.can_manage)."""
+    return manageable_users(user)
+
+
+@app.get("/admin/users", response_class=HTMLResponse)
+async def admin_users_list(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    targets = _visible_targets(user)
+    return templates.TemplateResponse("admin_users_list.html", _ctx(request, user, targets=targets))
+
+
+@app.get("/admin/users/view/{telegram_id}", response_class=HTMLResponse)
+async def admin_user_view(telegram_id: int, request: Request, user: UserInfo = Depends(get_current_user)):
+    """Карточка статистики + баллы/наказания, как в боте."""
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    target = get_user(telegram_id)
+    if not target:
+        return RedirectResponse("/admin/users")
+
+    from handlers.stats import render_stats_text
+    stats_html = await render_stats_text(telegram_id)
+
+    return templates.TemplateResponse(
+        "admin_user_view.html",
+        _ctx(
+            request, user, target=target, stats_html=stats_html,
+            can_manage_target=can_manage(user, target),
+            punishment_types=PUNISHMENT_TYPES, result=None,
+        ),
+    )
+
+
+@app.post("/admin/users/view/{telegram_id}/points", response_class=HTMLResponse)
+async def admin_user_points(
+    telegram_id: int, request: Request, user: UserInfo = Depends(get_current_user),
+    amount: str = Form(...), reason: str = Form(...),
+):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    target = get_user(telegram_id)
+    if not target:
+        return RedirectResponse("/admin/users")
+
+    error = None
+    try:
+        amount_val = float(str(amount).strip().replace(" ", "").replace(",", "."))
+    except ValueError:
+        amount_val = 0
+        error = 'Неверный формат количества баллов. Пример: "+100" или "-100".'
+    if not error and not can_manage(user, target):
+        error = "Недостаточно прав для действий над этим пользователем."
+
+    if error:
+        from handlers.stats import render_stats_text
+        stats_html = await render_stats_text(telegram_id)
+        return templates.TemplateResponse(
+            "admin_user_view.html",
+            _ctx(
+                request, user, target=target, stats_html=stats_html,
+                can_manage_target=can_manage(user, target),
+                punishment_types=PUNISHMENT_TYPES, result={"error": error},
+            ),
+        )
+
+    sheets = get_sheets()
+    row_idx = await _run(sheets.find_nick_row, target.nickname)
+    if row_idx:
+        old, new = await _run(sheets.add_points, row_idx, amount_val)
+        await sheets.log_points(target.nickname, user.nickname, amount_val, old, new, reason.strip())
+        target_row = await _run(sheets.get_user_row, telegram_id)
+        vk = target_row.get("VK") if target_row else None
+        vk_id = int(vk) if vk and str(vk).isdigit() else None
+        await vk_bridge.announce_points(target.nickname, vk_id, target.org, amount_val, reason.strip())
+        bot: Bot = app.state.bot
+        try:
+            await bot.send_message(
+                telegram_id,
+                f"Администратор {user.nickname} изменил ваше количество баллов на {amount_val}.\n"
+                f"Старое значение: {old}\nПричина: {reason.strip()}",
+            )
+        except Exception:
+            pass
+        result = {"ok": True, "kind": "points", "amount": amount_val}
+    else:
+        result = {"error": f"Не нашёл {target.nickname} в текущей таблице — баллы не изменены."}
+
+    from handlers.stats import render_stats_text
+    stats_html = await render_stats_text(telegram_id)
+    return templates.TemplateResponse(
+        "admin_user_view.html",
+        _ctx(
+            request, user, target=target, stats_html=stats_html,
+            can_manage_target=can_manage(user, target),
+            punishment_types=PUNISHMENT_TYPES, result=result,
+        ),
+    )
+
+
+@app.post("/admin/users/view/{telegram_id}/punish", response_class=HTMLResponse)
+async def admin_user_punish(
+    telegram_id: int, request: Request, user: UserInfo = Depends(get_current_user),
+    action: str = Form(...), ptype: str = Form(...), reason: str = Form(...),
+):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    target = get_user(telegram_id)
+    if not target:
+        return RedirectResponse("/admin/users")
+
+    error = None
+    if not can_manage(user, target):
+        error = "Недостаточно прав для действий над этим пользователем."
+    elif ptype not in PUNISHMENT_TYPES:
+        error = "Неизвестный тип наказания."
+    elif action not in ("give", "remove"):
+        error = "Неизвестное действие."
+
+    if not error:
+        sheets = get_sheets()
+        row_idx = await _run(sheets.find_nick_row, target.nickname)
+        if row_idx:
+            col = PUNISHMENT_SHEET_COL[ptype]
+            delta = 1 if action == "give" else -1
+            await _run(sheets.change_punishment_count, row_idx, col, delta)
+        if action == "give":
+            await sheets.log_punishment_issue(target.nickname, user.nickname, ptype, reason.strip())
+            target_row = await _run(sheets.get_user_row, telegram_id)
+            vk = target_row.get("VK") if target_row else None
+            vk_id = int(vk) if vk and str(vk).isdigit() else None
+            await vk_bridge.announce_punishment(target.nickname, vk_id, target.org, ptype, reason.strip())
+        else:
+            await sheets.log_punishment_remove(target.nickname, ptype, reason.strip(), user.nickname)
+
+        bot: Bot = app.state.bot
+        try:
+            if action == "give":
+                await bot.send_message(
+                    telegram_id, f'Вы получили «{ptype}» от администратора {user.nickname}, причина: {reason.strip()}.'
+                )
+            else:
+                await bot.send_message(
+                    telegram_id, f"{ptype} был снят администратором {user.nickname}.\n\nПричина:\n{reason.strip()}"
+                )
+        except Exception:
+            pass
+        result = {"ok": True, "kind": "punish", "action": action, "ptype": ptype}
+    else:
+        result = {"error": error}
+
+    from handlers.stats import render_stats_text
+    stats_html = await render_stats_text(telegram_id)
+    return templates.TemplateResponse(
+        "admin_user_view.html",
+        _ctx(
+            request, user, target=target, stats_html=stats_html,
+            can_manage_target=can_manage(user, target),
+            punishment_types=PUNISHMENT_TYPES, result=result,
+        ),
+    )
+
+
+@app.get("/admin/users/add", response_class=HTMLResponse)
+async def admin_add_user_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    show_org_picker = user.role >= Role.LEADERSHIP or user.role == Role.SENIOR_WATCHER
+    orgs = ALL_ORGS
+    if user.role == Role.SENIOR_WATCHER:
+        orgs = SENIOR_GROUPS.get(user.org, ALL_ORGS)
+    return templates.TemplateResponse(
+        "admin_add_user.html",
+        _ctx(request, user, show_org_picker=show_org_picker, orgs=orgs, result=None),
+    )
+
+
+@app.post("/admin/users/add", response_class=HTMLResponse)
+async def admin_add_user_submit(
+    request: Request,
+    user: UserInfo = Depends(get_current_user),
+    telegram_id: int = Form(...),
+    nickname: str = Form(...),
+    org: str = Form(None),
+    rank: int = Form(...),
+):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+
+    clean_nick = nickname.strip().replace("\xa0", " ").replace("\u200b", "").strip()
+    target_org = user.org if user.role in (Role.LEADER, Role.WATCHER) else org
+
+    sheets = get_sheets()
+    today = dt.datetime.now(MSK_TZ).strftime("%d.%m.%Y")
+    row = await _run(sheets.assign_nick_to_org, target_org, clean_nick, today)
+    await _run(
+        sheets.upsert_user, telegram_id,
+        NickName=clean_nick, Role=role_name(Role.STAFF), Org=target_org,
+        AddedBy=user.nickname, AddedDate=today, Rank=rank,
+    )
+    set_user(telegram_id, clean_nick, Role.STAFF, target_org, row)
+    await sheets.log_access(clean_nick, user.nickname, "🟢 Выдано")
+
+    orgs = ALL_ORGS
+    show_org_picker = user.role >= Role.LEADERSHIP or user.role == Role.SENIOR_WATCHER
+    result = {"nickname": clean_nick, "org": target_org, "rank": rank}
+    return templates.TemplateResponse(
+        "admin_add_user.html",
+        _ctx(request, user, show_org_picker=show_org_picker, orgs=orgs, result=result),
+    )
+
+
+# ============================================================ Удалить пользователя
+@app.get("/admin/users/remove", response_class=HTMLResponse)
+async def admin_remove_user_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    targets = [u for u in _visible_targets(user) if u.telegram_id != user.telegram_id]
+    return templates.TemplateResponse(
+        "admin_remove_user.html", _ctx(request, user, targets=targets, result=None)
+    )
+
+
+@app.post("/admin/users/remove", response_class=HTMLResponse)
+async def admin_remove_user_submit(
+    request: Request,
+    user: UserInfo = Depends(get_current_user),
+    nickname: str = Form(...),
+    reason: str = Form(...),
+):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+
+    sheets = get_sheets()
+    bot: Bot = app.state.bot
+    target = next((u for u in all_users() if u.nickname == nickname), None)
+
+    # Форму можно отправить и не через кнопку сайта (обычный HTTP POST) — поэтому
+    # иерархию/зону ответственности проверяем здесь ещё раз, а не только рендерингом
+    # списка целей на GET-странице.
+    if target and not can_manage(user, target):
+        targets = [u for u in _visible_targets(user) if u.telegram_id != user.telegram_id]
+        result = {"error": "Недостаточно прав для действий над этим пользователем."}
+        return templates.TemplateResponse(
+            "admin_remove_user.html", _ctx(request, user, targets=targets, result=result)
+        )
+
+    if target:
+        row_idx = await _run(sheets.find_nick_row, target.nickname)
+        if row_idx:
+            await _run(sheets.clear_nick_slot, row_idx)
+        await _run(sheets.delete_user, target.telegram_id)
+        from utils.access import remove_user as cache_remove_user
+        cache_remove_user(target.telegram_id)
+        await sheets.log_access(nickname, user.nickname, "🔴 Снят", reason)
+        try:
+            await bot.send_message(
+                target.telegram_id,
+                f"Вы были сняты с должности, администратором {user.nickname}.\nПричина: {reason}",
+            )
+        except Exception:
+            pass
+
+    targets = [u for u in _visible_targets(user) if u.telegram_id != user.telegram_id]
+    result = {"nickname": nickname}
+    return templates.TemplateResponse(
+        "admin_remove_user.html", _ctx(request, user, targets=targets, result=result)
+    )
+
+
+# ============================================================ Выдать доступ (роль/организация)
+@app.get("/admin/grant-role", response_class=HTMLResponse)
+async def admin_grant_role_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.SENIOR_WATCHER:
+        return RedirectResponse("/profile")
+
+    if user.role >= Role.LEADERSHIP:
+        candidates = [u for u in all_users() if u.role < Role.LEADERSHIP]
+        orgs = ALL_ORGS
+        allow_senior_watcher = True
+    else:
+        group_orgs = SENIOR_GROUPS.get(user.org, [])
+        candidates = [u for u in all_users() if u.org in group_orgs and u.role < Role.SENIOR_WATCHER]
+        orgs = group_orgs
+        allow_senior_watcher = False
+
+    return templates.TemplateResponse(
+        "admin_grant_role.html",
+        _ctx(
+            request, user, candidates=candidates, orgs=orgs, senior_groups=list(SENIOR_GROUPS.keys()),
+            allow_senior_watcher=allow_senior_watcher, result=None,
+        ),
+    )
+
+
+@app.post("/admin/grant-role", response_class=HTMLResponse)
+async def admin_grant_role_submit(
+    request: Request,
+    user: UserInfo = Depends(get_current_user),
+    nickname: str = Form(...),
+    role_value: int = Form(...),
+    org_or_group: str = Form(...),
+):
+    if user.role < Role.SENIOR_WATCHER:
+        return RedirectResponse("/profile")
+
+    target = next((u for u in all_users() if u.nickname == nickname), None)
+    try:
+        role = Role(role_value)
+    except ValueError:
+        role = Role.NONE
+
+    # role_value и org_or_group приходят из тела запроса — проверяем на сервере,
+    # а не только в форме.
+    grant_error = None
+    if not target or not can_manage(user, target):
+        grant_error = "Этот пользователь вне вашей зоны ответственности (или равен/выше вас по роли)."
+    elif role > max_grantable_role(user):
+        grant_error = "Вы не вправе выдавать эту роль."
+    elif user.role < Role.LEADERSHIP and org_or_group not in visible_orgs(user) and org_or_group not in SENIOR_GROUPS:
+        grant_error = "Эта организация/группа вне вашей зоны ответственности."
+    elif role == Role.SENIOR_WATCHER and org_or_group not in SENIOR_GROUPS:
+        grant_error = "Для роли «Старший следящий» нужно выбрать направление (группу), а не отдельную организацию."
+
+    if grant_error:
+        if user.role >= Role.LEADERSHIP:
+            candidates = [u for u in all_users() if u.role < Role.LEADERSHIP]
+            orgs = ALL_ORGS
+            allow_senior_watcher = True
+        else:
+            group_orgs = SENIOR_GROUPS.get(user.org, [])
+            candidates = [u for u in all_users() if u.org in group_orgs and u.role < Role.SENIOR_WATCHER]
+            orgs = group_orgs
+            allow_senior_watcher = False
+        return templates.TemplateResponse(
+            "admin_grant_role.html",
+            _ctx(
+                request, user, candidates=candidates, orgs=orgs, senior_groups=list(SENIOR_GROUPS.keys()),
+                allow_senior_watcher=allow_senior_watcher, result={"error": grant_error},
+            ),
+        )
+
+    if target:
+        sheets = get_sheets()
+        bot: Bot = app.state.bot
+        await _run(sheets.upsert_user, target.telegram_id, Role=role_name(role), Org=org_or_group)
+        set_user(target.telegram_id, target.nickname, role, org_or_group, target.row)
+        await sheets.log_moderation(user.nickname, "grant_role", target.nickname, f"{role_name(role)} / {org_or_group}")
+        target_row = await _run(sheets.get_user_row, target.telegram_id)
+        target_vk = target_row.get("VK") if target_row else None
+        target_vk_id = int(target_vk) if target_vk and str(target_vk).isdigit() else None
+        await vk_bridge.announce_role_assigned(target.nickname, target_vk_id, role, org_or_group)
+        try:
+            await bot.send_message(
+                target.telegram_id,
+                f"Вам выдана роль «{role_name(role)}» ({org_or_group}) администратором {user.nickname}.",
+            )
+        except Exception:
+            pass
+
+    if user.role >= Role.LEADERSHIP:
+        candidates = [u for u in all_users() if u.role < Role.LEADERSHIP]
+        orgs = ALL_ORGS
+        allow_senior_watcher = True
+    else:
+        group_orgs = SENIOR_GROUPS.get(user.org, [])
+        candidates = [u for u in all_users() if u.org in group_orgs and u.role < Role.SENIOR_WATCHER]
+        orgs = group_orgs
+        allow_senior_watcher = False
+
+    result = {"nickname": nickname, "role": role_name(role), "org": org_or_group}
+    return templates.TemplateResponse(
+        "admin_grant_role.html",
+        _ctx(
+            request, user, candidates=candidates, orgs=orgs, senior_groups=list(SENIOR_GROUPS.keys()),
+            allow_senior_watcher=allow_senior_watcher, result=result,
+        ),
+    )
+
+
+# ============================================================ Заявки (одобрение/отказ)
+_APP_TYPE_LABELS = {
+    "extra_work": "Доп работа",
+    "inactive": "Неактив",
+    "remove_punish": "Снятие наказаний",
+}
+
+
+def _visible_applications(user: UserInfo, apps: list[dict]) -> list[dict]:
+    if user.role >= Role.LEADERSHIP:
+        return apps
+    visible_nicks = {u.nickname for u in all_users() if u.org == user.org} if user.org else set()
+    return [a for a in apps if a.get("NickName") in visible_nicks]
+
+
+@app.get("/admin/reviews", response_class=HTMLResponse)
+async def admin_reviews_menu(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    sheets = get_sheets()
+    counts = {}
+    for t in _APP_TYPE_LABELS:
+        pending = await _run(sheets.get_pending_applications, t)
+        counts[t] = len(_visible_applications(user, pending))
+    return templates.TemplateResponse(
+        "admin_reviews_menu.html", _ctx(request, user, counts=counts, labels=_APP_TYPE_LABELS)
+    )
+
+
+@app.get("/admin/reviews/{app_type}", response_class=HTMLResponse)
+async def admin_reviews_list(app_type: str, request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER or app_type not in _APP_TYPE_LABELS:
+        return RedirectResponse("/admin/reviews")
+    sheets = get_sheets()
+    pending = await _run(sheets.get_pending_applications, app_type)
+    pending = _visible_applications(user, pending)
+    return templates.TemplateResponse(
+        "admin_reviews_list.html",
+        _ctx(request, user, app_type=app_type, label=_APP_TYPE_LABELS[app_type], items=pending),
+    )
+
+
+@app.get("/admin/reviews/{app_type}/{app_id}", response_class=HTMLResponse)
+async def admin_review_detail(
+    app_type: str, app_id: str, request: Request, user: UserInfo = Depends(get_current_user)
+):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    sheets = get_sheets()
+    all_pending = await _run(sheets.get_pending_applications)
+    application = next((a for a in all_pending if str(a["ID"]) == str(app_id)), None)
+    if not application:
+        return RedirectResponse(f"/admin/reviews/{app_type}")
+
+    target = next((u for u in all_users() if u.nickname == application.get("NickName")), None)
+    data_raw = application.get("Data", "") or ""
+
+    photo_file_ids: list[str] = []
+    if app_type == "extra_work":
+        work, _, proof = data_raw.partition("|")
+        photo_file_ids = [f for f in proof.split(",") if f]
+        data_line = work or "—"
+    else:
+        data_line = data_raw
+
+    return templates.TemplateResponse(
+        "admin_review_detail.html",
+        _ctx(
+            request, user, app_type=app_type, label=_APP_TYPE_LABELS.get(app_type, app_type),
+            application=application, target=target, data_line=data_line,
+            photo_file_ids=photo_file_ids,
+        ),
+    )
+
+
+@app.post("/admin/reviews/{app_type}/{app_id}/approve")
+async def admin_review_approve(app_type: str, app_id: str, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile", status_code=303)
+
+    sheets = get_sheets()
+    bot: Bot = app.state.bot
+
+    all_pending = await _run(sheets.get_pending_applications)
+    app_preview = next((a for a in all_pending if str(a["ID"]) == str(app_id)), None)
+    preview_target = next((u for u in all_users() if u.nickname == (app_preview or {}).get("NickName")), None)
+    if not preview_target or preview_target.org not in visible_orgs(user):
+        return RedirectResponse(f"/admin/reviews/{app_type}", status_code=303)
+
+    application = await _run(sheets.decide_application, int(app_id), "approved", user.nickname)
+    if not application:
+        return RedirectResponse(f"/admin/reviews/{app_type}", status_code=303)
+
+    target = next((u for u in all_users() if u.nickname == application.get("NickName")), None)
+    data_raw = application.get("Data", "") or ""
+    nick = application.get("NickName", "?")
+
+    if app_type == "extra_work":
+        work, _, proof = data_raw.partition("|")
+        if target:
+            await sheets.log_extra_work(target.nickname, user.nickname, work, proof)
+        target_msg = f"Ваша заявка на доп.работу под номером #{app_id} была одобрена администратором {user.nickname}."
+    elif app_type == "inactive":
+        dates_part = data_raw.split("|", 1)[0]
+        if target:
+            start_str, _, end_str = dates_part.partition("/")
+            try:
+                start_date = dt.datetime.strptime(start_str.strip(), "%d.%m.%Y").date()
+                end_date = dt.datetime.strptime(end_str.strip(), "%d.%m.%Y").date()
+                if end_date < start_date:
+                    start_date, end_date = end_date, start_date
+                day = start_date
+                while day <= end_date:
+                    await _run(sheets.mark_inactive_day, target.nickname, day)
+                    day += dt.timedelta(days=1)
+            except ValueError:
+                pass
+        target_msg = f"Ваша заявка на неактив под номером #{app_id} была одобрена администратором {user.nickname}"
+    elif app_type == "remove_punish":
+        ptype, proof = (data_raw.split("|", 1) + [""])[:2]
+        if target:
+            row_idx = await _run(sheets.find_nick_row, target.nickname)
+            col = {"Выговор": "L", "Предупреждение": "M", "Устный выговор": "N"}.get(ptype)
+            if row_idx and col:
+                await _run(sheets.change_punishment_count, row_idx, col, -1)
+            await sheets.log_punishment_remove(target.nickname, ptype, "system", user.nickname, proof)
+        target_msg = f"Ваша заявка на снятие наказаний под номером #{app_id} была одобрена администратором {user.nickname}"
+    else:
+        target_msg = f"Ваша заявка #{app_id} была одобрена администратором {user.nickname}"
+
+    if target:
+        try:
+            await bot.send_message(target.telegram_id, target_msg)
+        except Exception:
+            pass
+    await sheets.log_moderation(user.nickname, f"approve_{app_type}", nick, f"#{app_id}: {data_raw}")
+
+    return RedirectResponse(f"/admin/reviews/{app_type}", status_code=303)
+
+
+@app.post("/admin/reviews/{app_type}/{app_id}/reject", response_class=HTMLResponse)
+async def admin_review_reject(
+    app_type: str, app_id: str, request: Request,
+    user: UserInfo = Depends(get_current_user),
+    reason: str = Form(...),
+):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile", status_code=303)
+
+    sheets = get_sheets()
+    bot: Bot = app.state.bot
+
+    all_pending = await _run(sheets.get_pending_applications)
+    app_preview = next((a for a in all_pending if str(a["ID"]) == str(app_id)), None)
+    preview_target = next((u for u in all_users() if u.nickname == (app_preview or {}).get("NickName")), None)
+    if not preview_target or preview_target.org not in visible_orgs(user):
+        return RedirectResponse(f"/admin/reviews/{app_type}", status_code=303)
+
+    application = await _run(sheets.decide_application, int(app_id), "rejected", user.nickname, reason)
+    if not application:
+        return RedirectResponse(f"/admin/reviews/{app_type}", status_code=303)
+
+    target = next((u for u in all_users() if u.nickname == application.get("NickName")), None)
+    nick = application.get("NickName", "?")
+    target_msg = (
+        f"Ваша заявка #{app_id} была отказана администратором {user.nickname}\n\nПричина отказа: {reason}"
+    )
+    if target:
+        try:
+            await bot.send_message(target.telegram_id, target_msg)
+        except Exception:
+            pass
+    await sheets.log_moderation(user.nickname, f"reject_{app_type}", nick, f"#{app_id}: {reason}")
+
+    return RedirectResponse(f"/admin/reviews/{app_type}", status_code=303)
+
+
+# ============================================================ Отчётности (просмотр)
+def _visible_orgs_for_reports(user: UserInfo) -> list[str]:
+    if user.role >= Role.LEADERSHIP:
+        return ALL_ORGS
+    if user.role == Role.SENIOR_WATCHER:
+        return SENIOR_GROUPS.get(user.org, [])
+    return [user.org] if user.org else []
+
+
+@app.get("/admin/reports", response_class=HTMLResponse)
+async def admin_reports_orgs(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    orgs = _visible_orgs_for_reports(user)
+    if len(orgs) == 1:
+        return RedirectResponse(f"/admin/reports/{orgs[0]}")
+    return templates.TemplateResponse("admin_reports_orgs.html", _ctx(request, user, orgs=orgs))
+
+
+@app.get("/admin/reports-export.xlsx")
+async def admin_reports_export(user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    from openpyxl import Workbook
+    import io
+
+    sheets = get_sheets()
+    orgs = None if user.role >= Role.LEADERSHIP else _visible_orgs_for_reports(user)
+    headers, rows = await _run(sheets.export_current_sheet_rows, orgs)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Отчёт"
+    ws.append(headers)
+    for row in rows:
+        ws.append(row)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"report_{sheets.current_sheet_title.replace(' ', '_')}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/admin/reports/{org}", response_class=HTMLResponse)
+async def admin_reports_nicks(org: str, request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER or org not in _visible_orgs_for_reports(user):
+        return RedirectResponse("/admin/reports")
+    nicks = sorted({u.nickname for u in all_users() if u.org == org and u.nickname})
+    return templates.TemplateResponse("admin_reports_nicks.html", _ctx(request, user, org=org, nicks=nicks))
+
+
+@app.get("/admin/reports/{org}/{nick}", response_class=HTMLResponse)
+async def admin_reports_view(org: str, nick: str, request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER or org not in _visible_orgs_for_reports(user):
+        return RedirectResponse("/admin/reports")
+    sheets = get_sheets()
+    reports = await _run(sheets.get_reports_for, nick)
+
+    today = dt.datetime.now(MSK_TZ).date()
+    last_30_days = [
+        {"iso": (today - dt.timedelta(days=i)).isoformat(), "label": (today - dt.timedelta(days=i)).strftime("%d.%m")}
+        for i in range(30)
+    ]
+
+    return templates.TemplateResponse(
+        "admin_reports_view.html",
+        _ctx(request, user, org=org, nick=nick, reports=reports, last_30_days=last_30_days),
+    )
+
+
+@app.get("/admin/reports/{org}/{nick}/day/{date_str}", response_class=HTMLResponse)
+async def admin_reports_day(
+    org: str, nick: str, date_str: str, request: Request, user: UserInfo = Depends(get_current_user)
+):
+    if user.role < Role.LEADER or org not in _visible_orgs_for_reports(user):
+        return RedirectResponse("/admin/reports")
+    try:
+        date_obj = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return RedirectResponse(f"/admin/reports/{org}/{nick}")
+
+    sheets = get_sheets()
+    cell = await _run(sheets.get_day_cell, nick, date_obj)
+
+    # Ищем совпадение в подробном логе отчётов (там же и статус, и фото, и работы),
+    # если человек сдавал отчёт именно за этот день.
+    date_ru = date_obj.strftime("%d.%m.%Y")
+    reports = await _run(sheets.get_reports_for, nick, limit=200)
+    log_entry = next((r for r in reports if str(r.get("ReportDate", "")).split()[0] == date_ru), None)
+
+    return templates.TemplateResponse(
+        "admin_reports_day.html",
+        _ctx(request, user, org=org, nick=nick, date_ru=date_ru, date_str=date_str, cell=cell, log_entry=log_entry),
+    )
+
+
+# ============================================================ Сдать фрапс обзвона
+@app.get("/admin/fraps", response_class=HTMLResponse)
+async def admin_fraps_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    return templates.TemplateResponse("admin_fraps.html", _ctx(request, user, orgs=ALL_ORGS, result=None))
+
+
+@app.post("/admin/fraps", response_class=HTMLResponse)
+async def admin_fraps_submit(
+    request: Request,
+    user: UserInfo = Depends(get_current_user),
+    candidate_nick: str = Form(...),
+    org: str = Form(...),
+    link: str = Form(...),
+):
+    if user.role < Role.LEADER:
+        return RedirectResponse("/profile")
+    sheets = get_sheets()
+    # Ничего не сохраняем в таблицы/кэш — только пересылаем в канал логов, как и в боте.
+    await sheets.log_fraps(candidate_nick, user.nickname, role_name(user.role), org, link)
+    result = {"candidate_nick": candidate_nick, "org": org}
+    return templates.TemplateResponse("admin_fraps.html", _ctx(request, user, orgs=ALL_ORGS, result=result))
+
+
+# ============================================================ Нормативы (только создатель)
+@app.get("/admin/norms", response_class=HTMLResponse)
+async def admin_norms(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    sheets = get_sheets()
+    norms = await _run(sheets.list_norms)
+    return templates.TemplateResponse(
+        "admin_norms.html", _ctx(request, user, norms=norms, orgs=ALL_ORGS, ranks=RANKS, result=None)
+    )
+
+
+@app.post("/admin/norms", response_class=HTMLResponse)
+async def admin_norms_submit(
+    request: Request,
+    user: UserInfo = Depends(get_current_user),
+    org: str = Form(...),
+    rank: int = Form(...),
+    vch: int = Form(0),
+    interview: int = Form(0),
+    lecture: int = Form(0),
+    training: int = Form(0),
+    rp: int = Form(0),
+    online_hours: float = Form(0),
+):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    sheets = get_sheets()
+    await _run(sheets.set_norm, org, rank, vch, interview, lecture, training, rp, online_hours)
+    norms = await _run(sheets.list_norms)
+    result = {"org": org, "rank": rank}
+    return templates.TemplateResponse(
+        "admin_norms.html", _ctx(request, user, norms=norms, orgs=ALL_ORGS, ranks=RANKS, result=result)
+    )
+
+
+# ============================================================ Прокси для фото из Telegram
+# Скрины хранятся как Telegram file_id (не публичный URL) — чтобы показать их прямо
+# на сайте (<img src=...>), нужно скачать байты через Bot API и отдать их самим.
+# Доступ закрыт логином (Depends(get_current_user)) — просто чтобы случайный человек
+# по ссылке не тащил чужие скрины, не более того.
+@app.get("/media/tg/{file_id}")
+async def media_telegram_photo(file_id: str, user: UserInfo = Depends(get_current_user)):
+    bot: Bot = app.state.bot
+    try:
+        file = await bot.get_file(file_id)
+        buf = await bot.download_file(file.file_path)
+        return Response(content=buf.read(), media_type="image/jpeg")
+    except Exception:
+        raise HTTPException(status_code=404, detail="photo not found")
+
+
+# ============================================================ Инструменты / команды
+@app.get("/tools/members", response_class=HTMLResponse)
+async def tools_members(request: Request, user: UserInfo = Depends(get_current_user)):
+    # На сайте нет живого /join-состояния из Telegram (это чисто внутренняя память бота) —
+    # показываем состав по организациям вместо "кто сейчас в игре".
+    if user.role >= Role.LEADERSHIP:
+        grouped = {org: [u for u in all_users() if u.org == org] for org in ALL_ORGS}
+    else:
+        grouped = {user.org: [u for u in all_users() if u.org == user.org]} if user.org else {}
+    return templates.TemplateResponse("tools_members.html", _ctx(request, user, grouped=grouped))
+
+
+# ============================================================ Инструменты: /ip (веб-версия)
+# ВАЖНО: этот роут должен быть объявлен ВЫШЕ заглушки "/tools/{page}" ниже по файлу —
+# иначе FastAPI матчит параметризованный путь раньше и /tools/ip всегда попадал бы
+# на placeholder.html, даже несмотря на то, что здесь есть рабочий обработчик.
+@app.get("/tools/ip", response_class=HTMLResponse)
+async def tools_ip_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.WATCHER:
+        return RedirectResponse("/profile")
+    return templates.TemplateResponse("ip_tool.html", _ctx(request, user, error=None, result=None))
+
+
+@app.post("/tools/ip", response_class=HTMLResponse)
+async def tools_ip_submit(
+    request: Request,
+    user: UserInfo = Depends(get_current_user),
+    ip1: str = Form(...),
+    ip2: str = Form(...),
+):
+    if user.role < Role.WATCHER:
+        return RedirectResponse("/profile")
+    d1 = await _run(get_ip_info, ip1.strip())
+    d2 = await _run(get_ip_info, ip2.strip())
+
+    if not d1 or d1.get("status") == "fail" or not d2 or d2.get("status") == "fail":
+        return templates.TemplateResponse(
+            "ip_tool.html",
+            _ctx(
+                request, user,
+                error="Проверьте IP-адреса (возможно, один из них не существует).",
+                result=None, ip1=ip1, ip2=ip2,
+            ),
+        )
+
+    lon1, lat1 = str(d1["lon"]).replace(",", "."), str(d1["lat"]).replace(",", ".")
+    lon2, lat2 = str(d2["lon"]).replace(",", "."), str(d2["lat"]).replace(",", ".")
+
+    r_lat1, r_lon1 = math.radians(d1["lat"]), math.radians(d1["lon"])
+    r_lat2, r_lon2 = math.radians(d2["lat"]), math.radians(d2["lon"])
+    dist = round(
+        6371 * 2 * math.asin(math.sqrt(
+            math.sin((r_lat2 - r_lat1) / 2) ** 2
+            + math.cos(r_lat1) * math.cos(r_lat2) * math.sin((r_lon2 - r_lon1) / 2) ** 2
+        ))
+    )
+    dist_fmt = f"{dist:,}".replace(",", " ")
+
+    map_url = (
+        f"https://static-maps.yandex.ru/1.x/?l=map&size=600,450"
+        f"&pt={lon1},{lat1},pm2rdm~{lon2},{lat2},pm2gnm"
+    )
+
+    return templates.TemplateResponse(
+        "ip_tool.html",
+        _ctx(
+            request, user, error=None,
+            result={"d1": d1, "d2": d2, "dist_fmt": dist_fmt, "map_url": map_url},
+        ),
+    )
+
+
+# ============================================================ Логирование
+_LOG_SHEET_BY_KEY = {
+    "access": (SHEET_LOG_ACCESS, "Логи доступа"),
+    "punish": (SHEET_LOG_PUNISH, "Логи наказаний"),
+    "points": (SHEET_LOG_POINTS, "Логи баллов"),
+    "extra": (SHEET_LOG_EXTRA, "Логи доп работ"),
+}
+
+
+@app.get("/admin/logs", response_class=HTMLResponse)
+async def admin_logs_menu(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.SENIOR_WATCHER:
+        return RedirectResponse("/profile")
+    return templates.TemplateResponse("admin_logs_menu.html", _ctx(request, user, log_types=_LOG_SHEET_BY_KEY))
+
+
+@app.get("/admin/logs/{log_key}", response_class=HTMLResponse)
+async def admin_logs_pick_nick(log_key: str, request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.SENIOR_WATCHER or log_key not in _LOG_SHEET_BY_KEY:
+        return RedirectResponse("/admin/logs")
+    orgs = visible_orgs(user)
+    nicks = sorted({u.nickname for u in all_users() if u.nickname and u.org in orgs})
+    label = _LOG_SHEET_BY_KEY[log_key][1]
+    return templates.TemplateResponse("admin_logs_nicks.html", _ctx(request, user, log_key=log_key, label=label, nicks=nicks))
+
+
+@app.get("/admin/logs/{log_key}/{nick}", response_class=HTMLResponse)
+async def admin_logs_show(log_key: str, nick: str, request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.SENIOR_WATCHER or log_key not in _LOG_SHEET_BY_KEY:
+        return RedirectResponse("/admin/logs")
+    target = next((u for u in all_users() if u.nickname == nick), None)
+    if not target or target.org not in visible_orgs(user):
+        return RedirectResponse(f"/admin/logs/{log_key}")
+    sheet_name, label = _LOG_SHEET_BY_KEY[log_key]
+    sheets = get_sheets()
+    logs = await _run(sheets.get_logs_for, sheet_name, nick)
+    return templates.TemplateResponse(
+        "admin_logs_show.html", _ctx(request, user, log_key=log_key, label=label, nick=nick, logs=logs)
+    )
+
+
+# ============================================================ Логи модераторов (руководство+)
+@app.get("/admin/moderation-logs", response_class=HTMLResponse)
+async def admin_moderation_logs(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADERSHIP:
+        return RedirectResponse("/profile")
+    sheets = get_sheets()
+    ws = await _run(sheets.ws, SHEET_LOG_MODERATION)
+    records = await _run(ws.get_all_records)
+    records = records[-30:][::-1]  # последние 30, новые сверху
+    return templates.TemplateResponse("admin_moderation_logs.html", _ctx(request, user, records=records))
+
+
+# ============================================================ Настройки (NickName / верификация другого человека)
+@app.get("/admin/settings", response_class=HTMLResponse)
+async def admin_settings_pick(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADERSHIP:
+        return RedirectResponse("/profile")
+    # Равных/старших себе (например, другого руководителя) редактировать нельзя —
+    # только создатель может редактировать вообще всех.
+    targets = [
+        u for u in all_users()
+        if u.telegram_id != user.telegram_id and (user.role == Role.CREATOR or u.role < user.role)
+    ]
+    return templates.TemplateResponse("admin_settings_pick.html", _ctx(request, user, targets=targets))
+
+
+def _can_edit_settings(user: UserInfo, target: UserInfo) -> bool:
+    return user.role == Role.CREATOR or target.role < user.role
+
+
+@app.get("/admin/settings/{telegram_id}", response_class=HTMLResponse)
+async def admin_settings_form(telegram_id: int, request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.LEADERSHIP:
+        return RedirectResponse("/profile")
+    target = get_user(telegram_id)
+    if not target or not _can_edit_settings(user, target):
+        return RedirectResponse("/admin/settings")
+    sheets = get_sheets()
+    profile_row = await _run(sheets.get_user_row, telegram_id) or {}
+    return templates.TemplateResponse(
+        "admin_settings_form.html", _ctx(request, user, target=target, profile=profile_row, result=None)
+    )
+
+
+@app.post("/admin/settings/{telegram_id}/nickname", response_class=HTMLResponse)
+async def admin_settings_nickname(
+    telegram_id: int, request: Request, user: UserInfo = Depends(get_current_user),
+    new_nickname: str = Form(...),
+):
+    if user.role < Role.LEADERSHIP:
+        return RedirectResponse("/profile")
+    target = get_user(telegram_id)
+    if not target or not _can_edit_settings(user, target):
+        return RedirectResponse("/admin/settings")
+
+    clean_nick = new_nickname.strip().replace("\xa0", " ").replace("\u200b", "").strip()
+    sheets = get_sheets()
+    row_idx = await _run(sheets.find_nick_row, target.nickname)
+    if row_idx:
+        ws = await _run(sheets.ws, sheets.current_sheet_title)
+        await _run(ws.update_cell, row_idx, 2, clean_nick)
+    await _run(sheets.upsert_user, telegram_id, NickName=clean_nick)
+    set_user(telegram_id, clean_nick, target.role, target.org, row_idx)
+
+    profile_row = await _run(sheets.get_user_row, telegram_id) or {}
+    result = {"ok": True, "field": "nickname", "value": clean_nick}
+    return templates.TemplateResponse(
+        "admin_settings_form.html", _ctx(request, user, target=get_user(telegram_id), profile=profile_row, result=result)
+    )
+
+
+@app.post("/admin/settings/{telegram_id}/verification", response_class=HTMLResponse)
+async def admin_settings_verification(
+    telegram_id: int, request: Request, user: UserInfo = Depends(get_current_user),
+    vk: str = Form(""), discord: str = Form(""), forum: str = Form(""),
+    age: str = Form(""), timezone: str = Form(""), tg_username: str = Form(""), email: str = Form(""),
+):
+    if user.role < Role.LEADERSHIP:
+        return RedirectResponse("/profile")
+    target = get_user(telegram_id)
+    if not target or not _can_edit_settings(user, target):
+        return RedirectResponse("/admin/settings")
+
+    sheets = get_sheets()
+    await _run(
+        sheets.upsert_user, telegram_id,
+        VK=vk, DiscordID=discord, Forum=forum, Age=age, Timezone=timezone,
+        TelegramUsername=tg_username, Email=email,
+    )
+    profile_row = await _run(sheets.get_user_row, telegram_id) or {}
+    result = {"ok": True, "field": "verification"}
+    return templates.TemplateResponse(
+        "admin_settings_form.html", _ctx(request, user, target=target, profile=profile_row, result=result)
+    )
+
+
+# ============================================================ Тесты (следящий+)
+def _quiz_scope_options(user: UserInfo) -> dict:
+    """Что этому пользователю разрешено выбрать в качестве адресата теста —
+    см. ТЗ: следящий — только своя организация; старший следящий — своя
+    организация ИЛИ сразу всё направление; руководство+ — всё, направление
+    целиком или отдельная организация."""
+    if user.role >= Role.LEADERSHIP:
+        return {
+            "mode": "leadership",
+            "orgs": ALL_ORGS,
+            "groups": {name: orgs for name, orgs in SENIOR_GROUPS.items()},
+        }
+    if user.role == Role.SENIOR_WATCHER:
+        group_orgs = SENIOR_GROUPS.get(user.org, [])
+        return {
+            "mode": "senior_watcher",
+            "orgs": group_orgs,
+            "group_name": user.org,
+        }
+    # WATCHER
+    return {"mode": "watcher", "org": user.org}
+
+
+def _resolve_quiz_scope(user: UserInfo, scope_choice: str, scope_value: str) -> list[str] | None:
+    """Превращает выбор из формы в конкретный список организаций, проверяя
+    его на сервере."""
+    if user.role >= Role.LEADERSHIP:
+        if scope_choice == "all":
+            return ALL_ORGS
+        if scope_choice == "group" and scope_value in SENIOR_GROUPS:
+            return SENIOR_GROUPS[scope_value]
+        if scope_choice == "org" and scope_value in ALL_ORGS:
+            return [scope_value]
+        return None
+    if user.role == Role.SENIOR_WATCHER:
+        group_orgs = SENIOR_GROUPS.get(user.org, [])
+        if scope_choice == "group":
+            return group_orgs
+        if scope_choice == "org" and scope_value in group_orgs:
+            return [scope_value]
+        return None
+    if user.role == Role.WATCHER:
+        return [user.org] if user.org else None
+    return None
+
+
+@app.get("/admin/quizzes", response_class=HTMLResponse)
+async def quizzes_menu(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.WATCHER:
+        return RedirectResponse("/profile")
+    return templates.TemplateResponse("admin_quizzes_menu.html", _ctx(request, user))
+
+
+@app.get("/admin/quizzes/create", response_class=HTMLResponse)
+async def quiz_create_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.WATCHER:
+        return RedirectResponse("/profile")
+    return templates.TemplateResponse(
+        "admin_quiz_create.html", _ctx(request, user, scope=_quiz_scope_options(user), result=None)
+    )
+
+
+@app.post("/admin/quizzes/create", response_class=HTMLResponse)
+async def quiz_create_submit(
+    request: Request, user: UserInfo = Depends(get_current_user),
+    title: str = Form(""), scope_choice: str = Form(""), scope_value: str = Form(""),
+):
+    if user.role < Role.WATCHER:
+        return RedirectResponse("/profile")
+
+    form = await request.form()
+    questions = [q.strip() for q in form.getlist("question") if q.strip()]
+    orgs = _resolve_quiz_scope(user, scope_choice, scope_value)
+
+    error = None
+    if not questions:
+        error = "Нужен хотя бы один вопрос."
+    elif not orgs:
+        error = "Не удалось определить организации теста — проверьте выбор и попробуйте снова."
+
+    if error:
+        return templates.TemplateResponse(
+            "admin_quiz_create.html",
+            _ctx(request, user, scope=_quiz_scope_options(user), result={"error": error}),
+        )
+
+    sheets = get_sheets()
+    quiz_id = await _run(
+        sheets.create_quiz, user.nickname, role_name(user.role),
+        title.strip() or f"Тест #{await _run(sheets.next_quiz_id)}", orgs, questions,
+    )
+    targets = [u for u in all_users() if u.org in orgs and u.role in (Role.STAFF, Role.LEADER)]
+    bot: Bot = app.state.bot
+    for t in targets:
+        try:
+            await bot.send_message(t.telegram_id, f'📝 Вам назначен новый тест на сайте: "{title.strip() or f"Тест #{quiz_id}"}". Зайдите на сайт, чтобы пройти его.')
+        except Exception:
+            pass
+        await _run(push.send_push_to_user, t.telegram_id, "Новый тест", "Вам назначен тест на сайте — зайдите, чтобы пройти его.", "/profile")
+    return templates.TemplateResponse(
+        "admin_quiz_create.html",
+        _ctx(request, user, scope=_quiz_scope_options(user), result={"ok": True, "quiz_id": quiz_id, "orgs": orgs}),
+    )
+
+
+@app.get("/admin/quizzes/results", response_class=HTMLResponse)
+async def quiz_results_menu(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.WATCHER:
+        return RedirectResponse("/profile")
+    sheets = get_sheets()
+    my_orgs = set(visible_orgs(user))
+    all_quizzes = await _run(sheets.list_quizzes)
+    quizzes = [q for q in all_quizzes if set(sheets.quiz_orgs(q)) & my_orgs]
+    quizzes.sort(key=lambda q: int(q.get("ID") or 0), reverse=True)
+    return templates.TemplateResponse("admin_quiz_results_menu.html", _ctx(request, user, quizzes=quizzes))
+
+
+@app.get("/admin/quizzes/results/{quiz_id}", response_class=HTMLResponse)
+async def quiz_results_view(quiz_id: int, request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role < Role.WATCHER:
+        return RedirectResponse("/profile")
+    sheets = get_sheets()
+    quiz = await _run(sheets.get_quiz, quiz_id)
+    if not quiz:
+        return RedirectResponse("/admin/quizzes/results")
+
+    my_orgs = set(visible_orgs(user))
+    quiz_orgs = set(sheets.quiz_orgs(quiz))
+    if not (quiz_orgs & my_orgs):
+        # Тест вообще не про мои организации — нечего тут смотреть.
+        return RedirectResponse("/admin/quizzes/results")
+
+    questions = sheets.quiz_questions(quiz)
+    raw_results = await _run(sheets.get_results_for_quiz, quiz_id)
+    # Следящий видит ответы только своей организации, ст.следящий — только своего
+    # направления, руководство/создатель — всех, кому назначен этот тест.
+    results = []
+    for r in raw_results:
+        if r.get("Org") not in my_orgs:
+            continue
+        try:
+            answers = json.loads(r.get("AnswersJSON") or "[]")
+        except (TypeError, ValueError):
+            answers = []
+        results.append({
+            "nickname": r.get("NickName"), "org": r.get("Org"),
+            "completed_at": r.get("CompletedAt"), "answers": answers,
+        })
+
+    return templates.TemplateResponse(
+        "admin_quiz_results_view.html",
+        _ctx(request, user, quiz=quiz, questions=questions, results=results),
+    )
+
+
+# ============================================================ Прохождение теста (STAFF/LEADER)
+@app.get("/quiz/{quiz_id}", response_class=HTMLResponse)
+async def quiz_take_page(quiz_id: int, request: Request, user: UserInfo = Depends(get_current_user)):
+    sheets = get_sheets()
+    quiz = await _run(sheets.get_quiz, quiz_id)
+    if not quiz or user.org not in sheets.quiz_orgs(quiz) or sheets.is_quiz_expired(quiz):
+        return RedirectResponse("/profile")
+    existing = await _run(sheets.get_quiz_result, quiz_id, user.telegram_id)
+    if existing and existing.get("Status") == "completed":
+        return RedirectResponse("/profile")
+    questions = sheets.quiz_questions(quiz)
+    return templates.TemplateResponse(
+        "quiz_take.html", _ctx(request, user, quiz=quiz, questions=questions, quiz_id=quiz_id)
+    )
+
+
+@app.post("/quiz/{quiz_id}/submit", response_class=HTMLResponse)
+async def quiz_submit(quiz_id: int, request: Request, user: UserInfo = Depends(get_current_user)):
+    sheets = get_sheets()
+    quiz = await _run(sheets.get_quiz, quiz_id)
+    if not quiz or user.org not in sheets.quiz_orgs(quiz) or sheets.is_quiz_expired(quiz):
+        return RedirectResponse("/profile")
+    questions = sheets.quiz_questions(quiz)
+    form = await request.form()
+    answers = [str(form.get(f"answer_{i}", "")).strip() for i in range(len(questions))]
+    await _run(sheets.submit_quiz, quiz_id, user.telegram_id, user.nickname, user.org or "", answers)
+    return RedirectResponse("/profile", status_code=303)
+
+
+@app.post("/quiz/{quiz_id}/violation")
+async def quiz_violation(quiz_id: int, request: Request, user: UserInfo = Depends(get_current_user)):
+    """Сайт зовёт это, когда JS теста замечает переключение вкладки/окна —
+    попытка сбрасывается (ничего не сохраняем), а следящему организации,
+    ст.следящему направления, руководству и создателю летит предупреждение."""
+    sheets = get_sheets()
+    quiz = await _run(sheets.get_quiz, quiz_id)
+    if quiz:
+        await sheets.log_quiz_violation(quiz_id, user.nickname, user.org or "—")
+        bot: Bot = app.state.bot
+        recipients: dict[int, None] = {}
+        if user.org:
+            for m in managers_for_org(user.org):
+                recipients[m.telegram_id] = None
+        recipients[CREATOR_ID] = None
+        text = (
+            f"🚨 <b>Нарушение при прохождении теста</b>\n\n"
+            f"{user.nickname} ({user.org or '—'}) свернул вкладку/переключился на другую "
+            f"во время прохождения теста #{quiz_id} — попытка не засчитана."
+        )
+        for tid in recipients:
+            try:
+                await bot.send_message(tid, text, parse_mode="HTML")
+            except Exception:
+                pass
+    return JSONResponse({"ok": True})
+
+
+# ============================================================ Назначить руководство (создатель)
+@app.get("/admin/assign-leadership", response_class=HTMLResponse)
+async def admin_assign_leadership_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    candidates = [u for u in all_users() if u.role < Role.LEADERSHIP]
+    return templates.TemplateResponse("admin_assign_leadership.html", _ctx(request, user, candidates=candidates, result=None))
+
+
+@app.post("/admin/assign-leadership", response_class=HTMLResponse)
+async def admin_assign_leadership_submit(
+    request: Request, user: UserInfo = Depends(get_current_user), nickname: str = Form(...)
+):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    target = next((u for u in all_users() if u.nickname == nickname), None)
+    if target:
+        sheets = get_sheets()
+        bot: Bot = app.state.bot
+        await _run(sheets.upsert_user, target.telegram_id, Role=role_name(Role.LEADERSHIP))
+        set_user(target.telegram_id, target.nickname, Role.LEADERSHIP, target.org, target.row)
+        await sheets.log_moderation(user.nickname, "assign_leadership", target.nickname, "")
+        try:
+            await bot.send_message(target.telegram_id, f"Вы назначены руководством администратором {user.nickname}.")
+        except Exception:
+            pass
+
+    candidates = [u for u in all_users() if u.role < Role.LEADERSHIP]
+    result = {"nickname": nickname}
+    return templates.TemplateResponse("admin_assign_leadership.html", _ctx(request, user, candidates=candidates, result=result))
+
+
+# ============================================================ Создать лист недели (создатель)
+@app.get("/admin/create-week-sheet", response_class=HTMLResponse)
+async def admin_create_week_sheet_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    return templates.TemplateResponse("admin_create_week_sheet.html", _ctx(request, user, result=None))
+
+
+@app.post("/admin/create-week-sheet", response_class=HTMLResponse)
+async def admin_create_week_sheet_submit(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    sheets = get_sheets()
+    now = dt.datetime.now(MSK_TZ)
+    try:
+        week_title, created = await _run(sheets.get_or_create_week_sheet_status, now)
+        if not week_title:
+            result = {"error": "Не удалось создать лист — проверь лист-шаблон в таблице."}
+        elif not created:
+            result = {"warn": f"Лист «{week_title}» уже существует."}
+        else:
+            await sheets.log_moderation(user.nickname, "create_week_sheet", "", f"Создан лист {week_title}")
+            result = {"ok": True, "week_title": week_title}
+    except Exception as e:
+        result = {"error": f"Ошибка: {e}"}
+    return templates.TemplateResponse("admin_create_week_sheet.html", _ctx(request, user, result=result))
+
+
+# ============================================================ Рассылка /o (создатель)
+@app.get("/admin/broadcast", response_class=HTMLResponse)
+async def admin_broadcast_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    return templates.TemplateResponse("admin_broadcast.html", _ctx(request, user, result=None))
+
+
+@app.post("/admin/broadcast", response_class=HTMLResponse)
+async def admin_broadcast_submit(
+    request: Request, user: UserInfo = Depends(get_current_user), text: str = Form(...)
+):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    bot: Bot = app.state.bot
+    full_text = f"❗️ Новое уведомление от Разработчика.\n\n{text}"
+    sent, failed = 0, 0
+    for u in all_users():
+        try:
+            await bot.send_message(u.telegram_id, full_text)
+            sent += 1
+        except Exception:
+            failed += 1
+    result = {"sent": sent, "failed": failed}
+    return templates.TemplateResponse("admin_broadcast.html", _ctx(request, user, result=result))
+
+
+# ============================================================ Текст /info (создатель)
+@app.get("/admin/set-info", response_class=HTMLResponse)
+async def admin_set_info_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    return templates.TemplateResponse("admin_set_info.html", _ctx(request, user, current_text=get_info_text(), result=None))
+
+
+@app.post("/admin/set-info", response_class=HTMLResponse)
+async def admin_set_info_submit(
+    request: Request, user: UserInfo = Depends(get_current_user), text: str = Form(...)
+):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    await set_info_text(text)
+    return templates.TemplateResponse(
+        "admin_set_info.html", _ctx(request, user, current_text=get_info_text(), result={"ok": True})
+    )
+
+
+# ============================================================ Диагностика ника (создатель)
+@app.get("/admin/find-nick", response_class=HTMLResponse)
+async def admin_find_nick_form(request: Request, user: UserInfo = Depends(get_current_user)):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    return templates.TemplateResponse("admin_find_nick.html", _ctx(request, user, result=None))
+
+
+@app.post("/admin/find-nick", response_class=HTMLResponse)
+async def admin_find_nick_submit(
+    request: Request, user: UserInfo = Depends(get_current_user), nickname: str = Form(...)
+):
+    if user.role != Role.CREATOR:
+        return RedirectResponse("/profile")
+    sheets = get_sheets()
+    result_text = await _run(sheets.debug_find_nick, nickname.strip())
+    return templates.TemplateResponse("admin_find_nick.html", _ctx(request, user, result=result_text))
+
+
+# ============================================================ Заглушки для "в разработке"
+@app.get("/admin/{page}", response_class=HTMLResponse)
+async def admin_placeholder(page: str, request: Request, user: UserInfo = Depends(get_current_user)):
+    return templates.TemplateResponse("placeholder.html", _ctx(request, user, page=page))
+
+
+@app.get("/tools/{page}", response_class=HTMLResponse)
+async def tools_placeholder(page: str, request: Request, user: UserInfo = Depends(get_current_user)):
+    return templates.TemplateResponse("placeholder.html", _ctx(request, user, page=page))

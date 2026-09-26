@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ label }}</h1>
+{% if not nicks %}
+<div class="alert warn">Список пуст.</div>
+{% else %}
+<div class="grid-links">
+  {% for n in nicks %}
+  <a class="card" href="/admin/logs/{{ log_key }}/{{ n }}"><span class="label">{{ n }}</span></a>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

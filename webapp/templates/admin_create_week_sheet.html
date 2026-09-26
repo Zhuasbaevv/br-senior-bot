@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>📅 Создать лист недели</h1>
+
+{% if result %}
+  {% if result.error %}
+  <div class="alert error">{{ result.error }}</div>
+  {% elif result.warn %}
+  <div class="alert warn">{{ result.warn }}</div>
+  {% elif result.ok %}
+  <div class="alert ok">✅ Новый лист создан: {{ result.week_title }}</div>
+  {% endif %}
+{% endif %}
+
+<div class="panel">
+  <p style="color:var(--text-dim); font-size:13.5px;">
+    Создаёт лист недели (Пн-Вс), включающей сегодняшнюю дату, копируя структуру
+    из листа-шаблона и перенося баллы/наказания активных сотрудников — то же самое,
+    что кнопка в боте.
+  </p>
+  <form method="post">
+    <button class="btn" type="submit">Создать</button>
+  </form>
+</div>
+{% endblock %}

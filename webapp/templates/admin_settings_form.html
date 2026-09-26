@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Настройки — {{ target.nickname }}</h1>
+
+{% if result and result.field == 'nickname' %}
+<div class="alert ok">✅ NickName обновлён на {{ result.value }}.</div>
+{% elif result and result.field == 'verification' %}
+<div class="alert ok">✅ Данные верификации обновлены.</div>
+{% endif %}
+
+<div class="panel">
+  <h2>NickName</h2>
+  <form method="post" action="/admin/settings/{{ target.telegram_id }}/nickname" style="display:flex; gap:8px;">
+    <input type="text" name="new_nickname" value="{{ target.nickname }}" required>
+    <button class="btn" type="submit">Сохранить</button>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>Верификация (вместо прохождения ботом)</h2>
+  <form method="post" action="/admin/settings/{{ target.telegram_id }}/verification">
+    <label>VK ID</label>
+    <input type="text" name="vk" value="{{ profile.get('VK', '') }}">
+    <label>Discord ID</label>
+    <input type="text" name="discord" value="{{ profile.get('DiscordID', '') }}">
+    <label>Ссылка на форум</label>
+    <input type="text" name="forum" value="{{ profile.get('Forum', '') }}">
+    <label>Возраст</label>
+    <input type="text" name="age" value="{{ profile.get('Age', '') }}">
+    <label>Часовой пояс</label>
+    <input type="text" name="timezone" value="{{ profile.get('Timezone', '') }}">
+    <label>Telegram @username</label>
+    <input type="text" name="tg_username" value="{{ profile.get('TelegramUsername', '') }}">
+    <label>Почта</label>
+    <input type="text" name="email" value="{{ profile.get('Email', '') }}">
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Сохранить</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

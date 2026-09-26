@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Логи модераторов (последние 30)</h1>
+{% if not records %}
+<div class="alert warn">Логов пока нет.</div>
+{% else %}
+<div class="panel">
+  {% for r in records %}
+  <div class="row">
+    <span class="k">{{ r.get('DateTime') }}</span>
+    <span class="v">{{ r.get('ActorNick') }} → {{ r.get('Action') }} → {{ r.get('TargetNick') }} ({{ r.get('Details') }})</span>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}
