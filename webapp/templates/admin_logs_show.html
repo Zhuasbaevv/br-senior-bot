@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ label }} — {{ nick }}</h1>
+{% if not logs %}
+<div class="alert warn">Логов не найдено.</div>
+{% else %}
+{% for log in logs %}
+<div class="panel">
+  <h2>Лог {{ loop.index }}</h2>
+  {% for k, v in log.items() %}
+  {% if v %}
+  <div class="row"><span class="k">{{ k }}</span><span class="v">{{ v }}</span></div>
+  {% endif %}
+  {% endfor %}
+</div>
+{% endfor %}
+{% endif %}
+{% endblock %}

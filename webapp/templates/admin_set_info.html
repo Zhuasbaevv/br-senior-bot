@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Текст команды /info</h1>
+
+{% if result %}
+<div class="alert ok">✅ Текст обновлён.</div>
+{% endif %}
+
+<div class="panel">
+  <label>Текущий текст</label>
+  <p style="color:var(--text-dim);">{{ current_text }}</p>
+  <form method="post">
+    <label>Новый текст</label>
+    <textarea name="text" required>{{ current_text }}</textarea>
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Сохранить</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

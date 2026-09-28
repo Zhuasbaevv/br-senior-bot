@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>➕️ Добавить пользователя</h1>
+
+{% if result %}
+<div class="alert ok">
+  ✅ Пользователь {{ result.nickname }} добавлен в организацию {{ result.org }} (ранг {{ result.rank }}).
+</div>
+{% endif %}
+
+<div class="panel">
+  <form method="post">
+    <label>Telegram ID</label>
+    <input type="number" name="telegram_id" required>
+    <label>NickName</label>
+    <input type="text" name="nickname" required>
+    {% if show_org_picker %}
+    <label>Организация</label>
+    <select name="org" required>
+      {% for o in orgs %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
+    </select>
+    {% endif %}
+    <label>Ранг</label>
+    <select name="rank" required>
+      <option value="7">Ранг 7</option>
+      <option value="8">Ранг 8</option>
+      <option value="9">Ранг 9</option>
+    </select>
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Добавить</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Заявка #{{ application['ID'] }} — {{ label }}</h1>
+
+<div class="panel">
+  <div class="row"><span class="k">NickName</span><span class="v">{{ application.get('NickName') }}</span></div>
+  <div class="row"><span class="k">Данные</span><span class="v">{{ data_line }}</span></div>
+  <div class="row"><span class="k">Фракция</span><span class="v">{{ target.org if target else '—' }}</span></div>
+  <div class="row"><span class="k">Должность</span><span class="v">{{ role_name(target.role) if target else '—' }}</span></div>
+  <div class="row"><span class="k">Подана</span><span class="v">{{ application.get('CreatedAt') }}</span></div>
+</div>
+
+{% if photo_file_ids %}
+<div class="panel">
+  <h2>Скрины</h2>
+  <div style="display:flex; gap:10px; flex-wrap:wrap;">
+    {% for fid in photo_file_ids %}
+    <img src="/media/tg/{{ fid }}" alt="скрин" style="max-width:280px; border-radius:8px; border:1px solid var(--border);">
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<div class="panel" style="display:flex; gap:12px; flex-wrap:wrap;">
+  <form method="post" action="/admin/reviews/{{ app_type }}/{{ application['ID'] }}/approve">
+    <button class="btn" type="submit">✅️ Одобрить</button>
+  </form>
+  <form method="post" action="/admin/reviews/{{ app_type }}/{{ application['ID'] }}/reject" style="display:flex; gap:8px; align-items:center;">
+    <input type="text" name="reason" placeholder="Причина отказа" required style="width:260px;">
+    <button class="btn danger" type="submit">❌️ Отказать</button>
+  </form>
+</div>
+{% endblock %}

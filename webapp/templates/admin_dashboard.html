@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>📊 Дашборд</h1>
+
+<div class="panel">
+  <h2>Баллы по дням (текущая неделя)</h2>
+  <canvas id="dailyChart" height="90"></canvas>
+</div>
+
+<div class="panel">
+  <h2>Баллы по организациям</h2>
+  <canvas id="orgChart" height="110"></canvas>
+</div>
+
+<div class="panel">
+  <h2>Топ-5 по баллам</h2>
+  {% if not data.top_users %}
+  <div class="row"><span class="k">—</span><span class="v">нет данных</span></div>
+  {% else %}
+  {% for nick, pts in data.top_users %}
+  <div class="row"><span class="k">{{ loop.index }}. {{ nick }}</span><span class="v">{{ pts }}</span></div>
+  {% endfor %}
+  {% endif %}
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script>
+const dayLabels = {{ data.day_labels | tojson }};
+const dailyTotals = {{ data.daily_totals | tojson }};
+const orgLabels = {{ data.org_totals.keys() | list | tojson }};
+const orgValues = {{ data.org_totals.values() | list | tojson }};
+
+new Chart(document.getElementById('dailyChart'), {
+  type: 'line',
+  data: {
+    labels: dayLabels,
+    datasets: [{ label: 'Баллы за день', data: dailyTotals, borderColor: '#e8a33d', backgroundColor: 'rgba(232,163,61,0.15)', tension: 0.25, fill: true }]
+  },
+  options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+});
+
+new Chart(document.getElementById('orgChart'), {
+  type: 'bar',
+  data: {
+    labels: orgLabels,
+    datasets: [{ label: 'Баллы', data: orgValues, backgroundColor: '#e8a33d' }]
+  },
+  options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+});
+</script>
+{% endblock %}

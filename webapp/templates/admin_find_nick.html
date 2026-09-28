@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Диагностика ника (/findnick)</h1>
+
+<div class="panel">
+  <form method="post">
+    <label>Ник для проверки</label>
+    <input type="text" name="nickname" required>
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Проверить</button>
+    </div>
+  </form>
+</div>
+
+{% if result %}
+<div class="panel">
+  <pre style="white-space:pre-wrap; font-family:var(--mono); font-size:12.5px;">{{ result }}</pre>
+</div>
+{% endif %}
+{% endblock %}

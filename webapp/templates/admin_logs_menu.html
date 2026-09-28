@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Логирование</h1>
+<div class="grid-links">
+  {% for key, val in log_types.items() %}
+  <a class="card" href="/admin/logs/{{ key }}"><span class="label">{{ val[1] }}</span></a>
+  {% endfor %}
+</div>
+{% endblock %}

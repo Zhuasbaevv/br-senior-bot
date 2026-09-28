@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>👤 {{ target.nickname }}</h1>
+
+{% if result and result.error %}
+<div class="alert warn">❌ {{ result.error }}</div>
+{% elif result and result.ok and result.kind == "points" %}
+<div class="alert ok">✅ Баллы изменены на {{ result.amount }}.</div>
+{% elif result and result.ok and result.kind == "punish" %}
+<div class="alert ok">
+  ✅ {{ "Наказание выдано" if result.action == "give" else "Наказание снято" }}: {{ result.ptype }}.
+</div>
+{% endif %}
+
+<div class="panel">
+  {{ stats_html | replace("<blockquote>", "<div style=\"margin:6px 0 14px;padding-left:10px;border-left:2px solid var(--border);\">") | replace("</blockquote>", "</div>") | safe }}
+</div>
+
+{% if can_manage_target %}
+<div class="panel">
+  <h2>💰 Изменить баллы</h2>
+  <form method="post" action="/admin/users/view/{{ target.telegram_id }}/points">
+    <label>Количество (например "+100" или "-100")</label>
+    <input type="text" name="amount" required placeholder="+100">
+    <label>Причина</label>
+    <textarea name="reason" required></textarea>
+    <div style="margin-top:14px;"><button class="btn" type="submit">Изменить баллы</button></div>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>⚠️ Наказание</h2>
+  <form method="post" action="/admin/users/view/{{ target.telegram_id }}/punish">
+    <label>Действие</label>
+    <select name="action" required>
+      <option value="give">Выдать</option>
+      <option value="remove">Снять</option>
+    </select>
+    <label>Тип наказания</label>
+    <select name="ptype" required>
+      {% for pt in punishment_types %}<option value="{{ pt }}">{{ pt }}</option>{% endfor %}
+    </select>
+    <label>Причина</label>
+    <textarea name="reason" required></textarea>
+    <div style="margin-top:14px;"><button class="btn danger" type="submit">Применить</button></div>
+  </form>
+</div>
+{% else %}
+<div class="alert warn">
+  Этот человек равен вам или выше по роли, либо не в вашей зоне ответственности — можно только смотреть статистику.
+</div>
+{% endif %}
+{% endblock %}

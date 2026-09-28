@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Настройки</h1>
+<div class="grid-links">
+  {% for t in targets %}
+  <a class="card" href="/admin/settings/{{ t.telegram_id }}"><span class="label">{{ t.nickname }} ({{ role_name(t.role) }})</span></a>
+  {% endfor %}
+</div>
+{% endblock %}

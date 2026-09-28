@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>🎥 Сдать фрапс обзвона</h1>
+
+{% if result %}
+<div class="alert ok">
+  Отчет успешно принят ({{ result.candidate_nick }}, {{ result.org }}).
+</div>
+{% endif %}
+
+<div class="panel">
+  <form method="post">
+    <label>Ник кандидата</label>
+    <input type="text" name="candidate_nick" required>
+    <label>Организация, которую человек прошёл обзвон</label>
+    <select name="org" required>
+      {% for o in orgs %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
+    </select>
+    <label>Ссылка на видео (YouTube)</label>
+    <input type="url" name="link" required>
+    <div style="margin-top:18px;">
+      <button class="btn" type="submit">Отправить</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

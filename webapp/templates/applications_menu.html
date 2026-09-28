@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Заявления</h1>
+<div class="grid-links">
+  <a class="card" href="/applications/report">
+    <span class="label">📋 Отчёт {{ today }}</span>
+  </a>
+  <a class="card" href="/applications/remove-punishment">
+    <span class="label">Снятие наказаний</span>
+  </a>
+  <a class="card" href="/applications/inactive">
+    <span class="label">Неактив</span>
+  </a>
+  <a class="card" href="/applications/extra-work">
+    <span class="label">Доп баллы</span>
+  </a>
+</div>
+{% endblock %}

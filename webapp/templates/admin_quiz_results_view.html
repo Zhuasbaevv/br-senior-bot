@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>📊 {{ quiz.Title }} <span style="color:var(--text-dim);font-weight:400;">#{{ quiz.ID }}</span></h1>
+<p style="color:var(--text-dim);font-size:13px;margin-top:-14px;">
+  Создал {{ quiz.CreatedBy }} ({{ quiz.CreatedByRole }}) · {{ quiz.CreatedAt }}
+</p>
+
+{% if not results %}
+<div class="alert warn">Пока никто не прошёл тест (или ответы вне вашей зоны видимости).</div>
+{% else %}
+{% for r in results %}
+<div class="panel">
+  <h2>{{ r.nickname }} <span style="color:var(--text-dim);font-weight:400;font-size:13px;">· {{ r.org }} · {{ r.completed_at }}</span></h2>
+  {% for q in questions %}
+  <div style="padding:10px 0;border-bottom:1px solid var(--border);">
+    <div style="color:var(--text-dim);font-family:var(--mono);font-size:12.5px;margin-bottom:4px;">{{ loop.index }}. {{ q }}</div>
+    <div>{{ r.answers[loop.index0] if loop.index0 < r.answers|length else "—" }}</div>
+  </div>
+  {% endfor %}
+</div>
+{% endfor %}
+{% endif %}
+{% endblock %}

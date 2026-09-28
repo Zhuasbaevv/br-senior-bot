@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>👥 Список пользователей</h1>
+<div class="panel">
+  <input type="text" id="user-search" placeholder="Поиск по нику/организации..." oninput="filterUsers()" style="margin-bottom:12px;">
+  <table class="table" id="users-table">
+    <tr><th>NickName</th><th>Роль</th><th>Организация</th><th>Telegram ID</th></tr>
+    {% for u in targets %}
+    <tr>
+      <td><a href="/admin/users/view/{{ u.telegram_id }}">{{ u.nickname }}</a></td>
+      <td>{{ role_name(u.role) }}</td>
+      <td>{{ u.org or '—' }}</td>
+      <td>{{ u.telegram_id }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+<script>
+function filterUsers() {
+  const q = document.getElementById('user-search').value.toLowerCase();
+  document.querySelectorAll('#users-table tr').forEach((row, i) => {
+    if (i === 0) return; // шапка
+    row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+}
+</script>
+{% endblock %}
